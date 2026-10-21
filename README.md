@@ -6,8 +6,9 @@
 一个分层的 mesh 传输器：**硬件解耦 / 路由 / 传输** 三层各自独立，任一层的实现都可以整体替换。
 
 目前 `tcp://` 是唯一编译进来的介质，`chat` 是唯一编译进来的应用协议 —— 但两者都只是"第一个实现"，
-不是架构的假设。整个工程 **零第三方依赖**（连 SHA-256 和 HMAC 都是手写并用 RFC 向量验证的），
-`cargo build` 不需要联网。
+不是架构的假设。依赖极少且**全部是纯 Rust**：只有 RustCrypto 的 `sha2` + `hmac`
+（连同传递依赖共 10 个 crate），没有 C 工具链、没有 `cc`/`bindgen`、不用 `ring`/`aws-lc-rs`。
+线格式、路由、限流、重传仍然全部自己实现——那些是产品本身，没有现成的可复用。
 
 ```
 alice <--tcp--> bob <--tcp--> carol      alice 和 carol 之间没有连接
@@ -105,7 +106,7 @@ reliable  acked 1   failed 0   retransmits 0
 │ retexis-link-tcp  介质层    "字节怎么动"                             │
 │   长度前缀分帧 · 读写分离 · 之后: http / ws / radio                   │
 └──────────────────────────────────────────────────────────────────────┘
-         retexis-crypto：SHA-256 / HMAC-SHA256 / Sealer（零依赖，RFC 向量验证）
+         retexis-crypto：Sealer 封装 HMAC-SHA256（RustCrypto 纯 Rust 实现）
 ```
 
 关键约定：
@@ -114,7 +115,7 @@ reliable  acked 1   failed 0   retransmits 0
 - **介质层拥有分帧权**。路由层只交给它一段已编码的信封字节，怎么放上介质由它决定
   （流式介质加长度前缀，数据报介质一包一帧，窄带介质自己切块）。这就是解耦点。
 - **认证是字节流上的过滤器**，在 `Envelope::decode` 之前跑，坏包根本进不了解码器。
-- 每层都能单独测试：54 个 Rust 测试 + 9 个模拟场景，其中包含真实 TCP 的多跳/环网/断链、
+- 每层都能单独测试：55 个 Rust 测试 + 9 个模拟场景，其中包含真实 TCP 的多跳/环网/断链、
   确定性丢包链路、四链路并发重连。
 
 ## crate 地图
@@ -122,7 +123,7 @@ reliable  acked 1   failed 0   retransmits 0
 | crate | 职责 | 依赖 |
 |---|---|---|
 | `retexis-core` | 线格式、ID、`Link` 抽象、介质注册表 | 无 |
-| `retexis-crypto` | SHA-256、HMAC-SHA256、信封密封 | 无 |
+| `retexis-crypto` | 信封密封（RustCrypto `sha2` + `hmac`） | 纯 Rust，无 C |
 | `retexis-link-tcp` | TCP 介质 | core |
 | `retexis-routing` | 路由表、转发、去重、限流、重传、拨号器 | core, crypto |
 | `retexis-app` | `Transport` trait、chat 通道、终端输出 | core, routing |
@@ -197,7 +198,8 @@ offset  size  field
 | 无 | 有 | 丢弃（无法验证，不猜） |
 | 无 | 无 | 放行（明文模式） |
 
-tag 比较是常数时间的，避免逐字节时序侧信道。这是**入网认证**（谁可以加入这个 mesh），
+tag 比较走 RustCrypto 的 `verify_truncated_left`（内部 `subtle::ct_eq`，常数时间），
+避免逐字节时序侧信道。这是**入网认证**（谁可以加入这个 mesh），
 不是节点身份认证：同一个 mesh 内的成员理论上可以伪造彼此的 `src`。真正的身份绑定需要
 每节点密钥对 + 签名，在路线图里。
 
@@ -342,7 +344,7 @@ python sim/server.py --preset grid --nodes 9 --port 9000
 ## 测试
 
 ```bash
-cargo test --workspace                  # 54 个测试
+cargo test --workspace                  # 55 个测试
 python sim/run.py all                   # 9 个场景
 python -m unittest sim/test_server.py    # 14 个 API 测试
 cargo clippy --workspace --all-targets
@@ -350,7 +352,7 @@ cargo clippy --workspace --all-targets
 
 Rust 侧覆盖的真实场景：
 
-- `crates/retexis-crypto`：FIPS/RFC 4231 向量、填充边界、常数时间比较、密钥不泄漏
+- `crates/retexis-crypto`：FIPS/RFC 4231 向量、截断 tag 校验、密钥不泄漏
 - `crates/retexis-core`：编解码往返、截断拒绝、名字 UTF-8 截断、与 Python 的字节级互通
 - `crates/retexis-link-tcp`：粘包/半包、超大帧、`shutdown` 唤醒阻塞的 `recv`
 - `crates/retexis-routing`：

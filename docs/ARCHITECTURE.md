@@ -138,13 +138,34 @@ tokio 会让"这个 `await` 点在哪"变成阅读理解题，而且在这个规
 代价：加字段要同时改 encode/decode 和文档。所以线格式里有 `version` 和 `flags`，
 破坏性变更靠 `version` 区分。
 
-### 手写 SHA-256 和 HMAC
+### 密码学用 RustCrypto，不用 ring
 
-同样的理由：两个原语的规范精确到可以逐位对照，而 RFC 向量（FIPS 180-2、RFC 4231）
-是现成的判据。"写 200 行然后对着向量测" 的风险，比往传输核心的依赖树里塞一串 crate 更小。
-7 个测试全部对着官方向量，另外还和 Python 的 `hashlib` 交叉验证过。
+一开始 SHA-256 和 HMAC 是手写的（217 行），理由是"零依赖"。后来换掉了——手写密码学是
+公认的反模式，而向量测试只能证明**实现正确**，证明不了**没有侧信道**。
 
-代价：没有经过密码学审计。真上生产应该换 ring/aws-lc，接口（`Sealer`）不用变。
+选 `sha2` + `hmac` 而不是 `ring` / `aws-lc-rs`，理由是具体的：
+
+| | RustCrypto (`sha2`+`hmac`) | `ring` / `aws-lc-rs` |
+|---|---|---|
+| 语言 | 纯 Rust | C + 汇编 |
+| 构建需要 | 只要 rustc | C 工具链、`cc`、有时还要 cmake |
+| `no_std` | 可以 | 不行 |
+| 审计 | 广泛使用、有专门审计 | 更成熟 |
+
+对一个可能跑在 LoRa 节点上的传输核心，"不需要 C 工具链"比"更成熟的汇编实现"更重要。
+代价是传递依赖从 0 变成 10 个纯 Rust crate（`digest`、`block-buffer`、`generic-array`、
+`typenum`、`subtle`、`cfg-if`、`cpufeatures` 等），全部无 C。
+
+三条约束保证这次替换是安全的：
+
+1. **`Sealer` 接口不变**。换库只动了 `retexis-crypto` 一个文件，`retexis-routing` 一行没改。
+2. **RFC 向量测试全部保留**。它们现在反过来验证"换库没有改变行为"——同样的输入必须出同样的字节。
+3. **跨语言向量测试还在跑**。Python 的 `hashlib`/`hmac` 生成的 golden 文件，Rust 侧必须逐字节匹配，
+   所以线格式的 tag 一个 bit 都没变。
+
+`verify` 用的是 `verify_truncated_left` 而不是 `verify_slice`：后者要求 tag 长度等于完整输出
+（32 字节），我们用的是 16 字节截断 tag，用错了会永远返回 false——这个坑我踩过一次，
+测试立刻抓住了。
 
 ### 单线程 router
 

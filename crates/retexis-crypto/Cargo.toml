@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Zero-dependency SHA-256, HMAC-SHA256 and the envelope sealer"
+description = "Envelope sealer for retexis, backed by RustCrypto (pure Rust, no C)"
 
 [dependencies]
+# Pure-Rust implementations from RustCrypto: no `cc`, no `bindgen`, no C
+# toolchain, and `no_std`-capable if this ever has to run on a constrained
+# target. Deliberately NOT `ring` or `aws-lc-rs`: both link C and assembly.
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
