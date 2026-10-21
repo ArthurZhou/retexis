@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/retexis-core",
+    "crates/retexis-crypto",
+    "crates/retexis-link-tcp",
+    "crates/retexis-routing",
+    "crates/retexis-app",
+    "crates/retexis-node",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+authors = ["retexis contributors"]
+
+[workspace.dependencies]
+retexis-core = { path = "crates/retexis-core" }
+retexis-crypto = { path = "crates/retexis-crypto" }
+retexis-link-tcp = { path = "crates/retexis-link-tcp" }
+retexis-routing = { path = "crates/retexis-routing" }
+retexis-app = { path = "crates/retexis-app" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"

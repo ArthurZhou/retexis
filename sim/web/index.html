@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>retexis 模拟器</title>
+<style>
+  :root {
+    --bg: #15171b;
+    --panel: #1b1e23;
+    --panel2: #21252b;
+    --line: #2b3038;
+    --text: #e6e8eb;
+    --muted: #8d97a3;
+    --accent: #5dcaa5;
+    --accent-dim: #2f6b58;
+    --warn: #e0a03a;
+    --danger: #e24b4a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: grid;
+    grid-template-rows: auto 1fr 170px;
+    height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.5 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    padding: 9px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  .brand { font-size: 14px; font-weight: 600; letter-spacing: .2px; }
+  .brand span { color: var(--muted); font-weight: 400; }
+  .group { display: flex; align-items: center; gap: 7px; }
+  .grow { flex: 1; }
+  button, select, input, textarea {
+    font: inherit; color: var(--text); background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 7px; padding: 5px 10px;
+    outline: none;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: #3d4552; background: #262b33; }
+  button.primary { background: var(--accent-dim); border-color: var(--accent); color: #eafff7; }
+  button.primary:hover { background: #357a63; }
+  button.on { background: #3a2f18; border-color: var(--warn); color: #f6d79a; }
+  button.danger { border-color: #5a2b2b; color: #f0a3a2; }
+  button.danger:hover { background: #3a1f20; }
+  button.warn { border-color: #4d3d1d; color: #f0cf95; }
+  input[type=number] { width: 58px; }
+  input[type=range] { padding: 0; background: none; border: none; width: 100%; accent-color: var(--accent); }
+  input[type=checkbox] { accent-color: var(--accent); }
+  .clock { font-family: var(--mono); color: var(--accent); min-width: 62px; text-align: right; }
+  .hint { color: var(--muted); font-size: 12px; min-height: 18px; }
+  .hint.flash { color: var(--warn); }
+
+  main { display: grid; grid-template-columns: 1fr 348px; min-height: 0; }
+  #stage { position: relative; overflow: hidden; background:
+      radial-gradient(circle at 1px 1px, #22262d 1px, transparent 0) 0 0 / 22px 22px; }
+  svg#graph { display: block; width: 100%; height: 100%; }
+
+  .node { cursor: grab; }
+  .node:active { cursor: grabbing; }
+  .node circle.body { fill: #0d2b23; stroke: var(--accent); stroke-width: 1.5; }
+  .node text.nm { fill: #cfe8df; font-size: 11px; text-anchor: middle; pointer-events: none; }
+  .node text.badge {
+    fill: #8fb9a9; font-size: 10px; text-anchor: middle;
+    font-family: var(--mono); pointer-events: none;
+  }
+  .node circle.dot { fill: var(--warn); opacity: 0; }
+  .node.pending circle.dot { opacity: 1; }
+  .node.down circle.body { fill: #2a1618; stroke: var(--danger); stroke-dasharray: 5 4; }
+  .node.down text.nm { fill: #b98d8c; }
+  .node.sel circle.body { stroke: #ffffff; stroke-width: 2.5; }
+  .node.linkfrom circle.body { stroke: var(--warn); stroke-width: 2.5; }
+  .node:hover circle.body { stroke-width: 2.5; }
+
+  .link line.vis { stroke: #3d6b5c; stroke-width: 2; }
+  .link line.hit { stroke: transparent; stroke-width: 16; cursor: pointer; }
+  .link:hover line.vis { stroke: #5dcaa5; }
+  .link.down line.vis { stroke: #5a3033; stroke-dasharray: 7 6; }
+  .link.sel line.vis { stroke: #ffffff; stroke-width: 2.5; }
+
+  aside {
+    border-left: 1px solid var(--line); background: var(--panel);
+    overflow-y: auto; padding: 14px;
+  }
+  aside h2 { font-size: 15px; margin: 0; font-weight: 600; }
+  aside h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); margin: 15px 0 7px; font-weight: 500;
+  }
+  .ihead { display: flex; align-items: baseline; gap: 8px; justify-content: space-between; }
+  .id { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .chip { font-size: 11px; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--line); }
+  .chip.ok { color: var(--accent); border-color: var(--accent-dim); }
+  .chip.bad { color: var(--danger); border-color: #5a2b2b; }
+  .rows { display: grid; gap: 8px; margin-top: 12px; }
+  .rows label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .rows label > input:not([type=range]):not([type=checkbox]) { flex: 1; min-width: 0; }
+  .rows label > input[type=range] { flex: 1; width: auto; min-width: 60px; }
+  .num { font-family: var(--mono); color: var(--text); min-width: 52px; text-align: right; font-size: 12px; }
+  .actions { display: flex; gap: 8px; margin-top: 12px; }
+  .actions button { flex: 1; }
+  .sendbox { display: grid; gap: 8px; }
+  .sendbox textarea { width: 100%; resize: vertical; min-height: 52px; }
+  .sendrow { display: flex; gap: 8px; align-items: center; }
+  .sendrow select { flex: 1; }
+  .chk { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .table { display: grid; gap: 2px; font-size: 12px; }
+  .tr { display: grid; grid-template-columns: 1fr 34px 52px; gap: 6px; padding: 3px 6px; border-radius: 5px; }
+  .tr:nth-child(odd) { background: #1f232a; }
+  .tr.th { color: var(--muted); font-size: 11px; background: none; }
+  .tr span:nth-child(2), .tr span:nth-child(3) { text-align: right; font-family: var(--mono); color: var(--muted); }
+  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; }
+  .stats > div { background: #1f232a; border-radius: 6px; padding: 5px 6px; text-align: center; }
+  .stats b { display: block; font-family: var(--mono); font-size: 13px; font-weight: 500; }
+  .stats span { font-size: 9.5px; color: var(--muted); }
+  .inbox { display: grid; gap: 6px; max-height: 260px; overflow-y: auto; }
+  .msg { background: #1f232a; border-radius: 7px; padding: 6px 8px; border-left: 2px solid var(--accent-dim); }
+  .msg.dm { border-left-color: var(--warn); }
+  .msg .who { font-weight: 500; }
+  .msg .meta { color: var(--muted); font-size: 10px; margin-left: 6px; font-family: var(--mono); }
+  .msg .txt { margin-top: 3px; word-break: break-word; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .empty { color: var(--muted); line-height: 1.9; }
+  .empty kbd {
+    font-family: var(--mono); font-size: 11px; background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px;
+  }
+
+  footer { border-top: 1px solid var(--line); background: #16181c; overflow: hidden; display: flex; }
+  #log {
+    flex: 1; overflow-y: auto; padding: 6px 10px;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.65;
+  }
+  .lrow { display: grid; grid-template-columns: 52px 84px 118px 1fr; gap: 8px; white-space: nowrap; }
+  .lt { color: #6f7a86; }
+  .lw { color: #9fb4c9; }
+  .ltag { color: var(--accent); }
+  .ld { color: #b9c2cc; overflow: hidden; text-overflow: ellipsis; }
+  .ltag.bad { color: var(--danger); }
+  #offline {
+    position: fixed; inset: auto 0 0 0; padding: 6px; text-align: center;
+    background: var(--danger); color: #fff; display: none;
+  }
+  #offline.show { display: block; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">retexis <span>simulator</span></div>
+
+  <div class="group">
+    <button id="btn-run" class="primary">▶ 运行</button>
+    <button id="btn-step">⏭ 单步</button>
+    <select id="rate" title="模拟速度">
+      <option value="0.25">0.25×</option>
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="2">2×</option>
+      <option value="5">5×</option>
+    </select>
+    <span class="clock" id="clock">0.00s</span>
+  </div>
+
+  <div class="group">
+    <button id="btn-link" title="点击两个节点创建链路">连线</button>
+    <button id="btn-add">+ 节点</button>
+    <select id="preset">
+      <option value="line">链式</option>
+      <option value="ring">环状</option>
+      <option value="grid">网格</option>
+      <option value="star">星形</option>
+    </select>
+    <input id="preset-count" type="number" value="4" min="2" max="16">
+    <button id="btn-apply">重建</button>
+  </div>
+
+  <div class="grow"></div>
+  <div class="hint" id="hint"></div>
+</header>
+
+<main>
+  <section id="stage">
+    <svg id="graph" viewBox="0 0 1000 620" preserveAspectRatio="xMidYMid meet"></svg>
+  </section>
+  <aside id="inspector"></aside>
+</main>
+
+<footer><div id="log"></div></footer>
+<div id="offline">与模拟器的连接断了 —— 服务端还在运行吗？</div>
+
+<script>
+"use strict";
+
+const SVGNS = "http://www.w3.org/2000/svg";
+const S = {
+  st: null,
+  sel: null,
+  linkMode: false,
+  linkFrom: null,
+  drag: null,
+  logSeq: 0,
+  byId: new Map(),
+  nodeEls: new Map(),
+  linkEls: new Map(),
+};
+
+/* ---------------------------------------------------------------- helpers */
+
+const $ = (sel) => document.querySelector(sel);
+
+function h(tag, attrs, ...kids) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === "class") node.className = v;
+    else if (k === "text") node.textContent = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else if (k === "checked") node.checked = !!v;
+    else node.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid === undefined || kid === null || kid === false) continue;
+    node.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return node;
+}
+
+function svgEl(tag, attrs) {
+  const node = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, v);
+  return node;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+async function api(path, method = "GET", body) {
+  const res = await fetch(path, {
+    method,
+    headers: { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* empty body */ }
+  if (!res.ok) { flash(data.error || res.statusText); return null; }
+  return data;
+}
+
+let hintTimer = null;
+function setHint(text, isError) {
+  const el = $("#hint");
+  el.textContent = text || "";
+  el.classList.toggle("flash", !!isError);
+}
+function flash(text) {
+  setHint(text, true);
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => setHint(""), 3000);
+}
+
+function nodeName(id) {
+  const n = S.byId.get(id);
+  return n ? n.name : id.slice(0, 8);
+}
+
+/* ------------------------------------------------------------------ graph */
+
+function makeNode(n) {
+  const g = svgEl("g", { class: "node", "data-id": n.id });
+  g.append(
+    svgEl("circle", { class: "body", r: 26 }),
+    svgEl("circle", { class: "dot", r: 4, cx: 19, cy: -19 }),
+    svgEl("text", { class: "badge", y: 4 }),
+    svgEl("text", { class: "nm", y: 44 })
+  );
+  g.addEventListener("mousedown", (ev) => onNodeDown(ev, n.id));
+  g.addEventListener("click", (ev) => { ev.stopPropagation(); onNodeClick(n.id); });
+  return g;
+}
+
+function updateNode(g, n) {
+  if (!(S.drag && S.drag.id === n.id)) {
+    g.setAttribute("transform", `translate(${n.x},${n.y})`);
+  }
+  g.classList.toggle("down", !n.alive);
+  g.classList.toggle("pending", n.pending > 0);
+  g.classList.toggle("sel", !!(S.sel && S.sel.kind === "node" && S.sel.id === n.id));
+  g.classList.toggle("linkfrom", S.linkFrom === n.id);
+  g.querySelector("text.nm").textContent = n.name;
+  g.querySelector("text.badge").textContent = n.routes.length || "";
+}
+
+function makeLink(l) {
+  const g = svgEl("g", { class: "link", "data-key": l.key });
+  g.append(svgEl("line", { class: "hit" }), svgEl("line", { class: "vis" }));
+  g.addEventListener("click", (ev) => { ev.stopPropagation(); selectLink(l.key); });
+  return g;
+}
+
+function updateLink(g, l) {
+  const a = S.byId.get(l.a);
+  const b = S.byId.get(l.b);
+  if (!a || !b) return;
+  for (const ln of g.querySelectorAll("line")) {
+    ln.setAttribute("x1", a.x); ln.setAttribute("y1", a.y);
+    ln.setAttribute("x2", b.x); ln.setAttribute("y2", b.y);
+  }
+  g.classList.toggle("down", !l.up);
+  g.classList.toggle("sel", !!(S.sel && S.sel.kind === "link" && S.sel.id === l.key));
+}
+
+function renderGraph() {
+  const st = S.st;
+  if (!st) return;
+  const graph = $("#graph");
+  S.byId = new Map(st.nodes.map((n) => [n.id, n]));
+
+  const alive = new Set();
+  for (const n of st.nodes) {
+    alive.add(n.id);
+    let g = S.nodeEls.get(n.id);
+    if (!g) { g = makeNode(n); S.nodeEls.set(n.id, g); graph.append(g); }
+    updateNode(g, n);
+  }
+  for (const [id, g] of [...S.nodeEls]) {
+    if (!alive.has(id)) { g.remove(); S.nodeEls.delete(id); }
+  }
+
+  const liveLinks = new Set();
+  for (const l of st.links) {
+    liveLinks.add(l.key);
+    let g = S.linkEls.get(l.key);
+    if (!g) {
+      g = makeLink(l);
+      S.linkEls.set(l.key, g);
+      graph.insertBefore(g, graph.firstChild); // links render under nodes
+    }
+    updateLink(g, l);
+  }
+  for (const [key, g] of [...S.linkEls]) {
+    if (!liveLinks.has(key)) { g.remove(); S.linkEls.delete(key); }
+  }
+}
+
+/* --------------------------------------------------------------- dragging */
+
+function toSvg(ev) {
+  const el = $("#graph");
+  const pt = el.createSVGPoint();
+  pt.x = ev.clientX; pt.y = ev.clientY;
+  const p = pt.matrixTransform(el.getScreenCTM().inverse());
+  return { x: p.x, y: p.y };
+}
+
+function onNodeDown(ev, id) {
+  if (S.linkMode) return;
+  const n = S.byId.get(id);
+  if (!n) return;
+  const p = toSvg(ev);
+  S.drag = { id, dx: p.x - n.x, dy: p.y - n.y, moved: false };
+  ev.preventDefault();
+}
+
+window.addEventListener("mousemove", (ev) => {
+  if (!S.drag) return;
+  const n = S.byId.get(S.drag.id);
+  if (!n) return;
+  const p = toSvg(ev);
+  const x = Math.max(34, Math.min(966, p.x - S.drag.dx));
+  const y = Math.max(34, Math.min(586, p.y - S.drag.dy));
+  if (Math.abs(x - n.x) + Math.abs(y - n.y) > 1) S.drag.moved = true;
+  n.x = x; n.y = y;
+  const g = S.nodeEls.get(S.drag.id);
+  if (g) g.setAttribute("transform", `translate(${x},${y})`);
+  for (const l of S.st.links) {
+    if (l.a === S.drag.id || l.b === S.drag.id) {
+      const lg = S.linkEls.get(l.key);
+      if (lg) updateLink(lg, l);
+    }
+  }
+});
+
+window.addEventListener("mouseup", () => {
+  if (!S.drag) return;
+  const { id, moved } = S.drag;
+  const n = S.byId.get(id);
+  S.drag = null;
+  if (moved && n) api(`/api/node/${id}`, "PATCH", { x: n.x, y: n.y });
+});
+
+$("#graph").addEventListener("click", () => {
+  if (S.linkMode && S.linkFrom) { S.linkFrom = null; setHint("已取消连线"); renderGraph(); return; }
+  clearSel();
+});
+
+/* -------------------------------------------------------------- selection */
+
+function selectNode(id) {
+  S.sel = { kind: "node", id };
+  S.linkFrom = null;
+  renderInspector();
+  renderGraph();
+}
+
+function selectLink(key) {
+  S.sel = { kind: "link", id: key };
+  renderInspector();
+  renderGraph();
+}
+
+function clearSel() {
+  if (!S.sel) return;
+  S.sel = null;
+  renderInspector();
+  renderGraph();
+}
+
+function onNodeClick(id) {
+  if (S.linkMode) {
+    if (!S.linkFrom) {
+      S.linkFrom = id;
+      setHint(`已选 ${nodeName(id)} —— 再点一个节点建立链路（Esc 取消）`);
+      renderGraph();
+      return;
+    }
+    if (S.linkFrom === id) {
+      S.linkFrom = null;
+      setHint("已取消连线");
+      renderGraph();
+      return;
+    }
+    const a = S.linkFrom;
+    S.linkFrom = null;
+    api("/api/link", "POST", { a, b: id }).then(() => { setHint(""); poll(); });
+    return;
+  }
+  selectNode(id);
+}
+
+/* ------------------------------------------------------------- inspector */
+
+const STAT_LABELS = {
+  sent: "发出", delivered: "投递", forwarded: "转发", retransmits: "重传",
+  acked: "已确认", delivery_failed: "失败", dropped_duplicate: "去重丢弃",
+  flood_suppressed: "限流丢弃", auth_rejected: "认证拒绝", duplicate_links: "重复链路",
+};
+
+function emptyInspector(box) {
+  box.append(
+    h("div", { class: "empty" },
+      h("p", {}, "点击画布上的节点或链路来查看和操作它。"),
+      h("p", {}, h("kbd", { text: "拖动节点" }), " 调整位置　", h("kbd", { text: "连线" }), " 后点两个节点建立链路"),
+      h("p", {}, h("kbd", { text: "+ 节点" }), " 添加节点　点链路可改延迟/丢包、切断、开启自动重连"),
+      h("p", {}, "选中节点后可以发送广播或可靠单播，并观察它的路由表、计数器和收件箱。")
+    )
+  );
+}
+
+function renderInspector() {
+  const box = $("#inspector");
+  box.innerHTML = "";
+  if (!S.st) return;
+  if (!S.sel) return emptyInspector(box);
+
+  if (S.sel.kind === "node") {
+    const n = S.st.nodes.find((x) => x.id === S.sel.id);
+    if (!n) { S.sel = null; return emptyInspector(box); }
+    return nodeInspector(box, n);
+  }
+  const l = S.st.links.find((x) => x.key === S.sel.id);
+  if (!l) { S.sel = null; return emptyInspector(box); }
+  return linkInspector(box, l);
+}
+
+function nodeInspector(box, n) {
+  box.append(
+    h("div", { class: "ihead" },
+      h("h2", { text: n.name }),
+      h("span", { class: "id", text: n.short })
+    ),
+    h("div", { class: "rows" },
+      h("label", {}, "名称", h("input", { id: "n-name", value: n.name, maxlength: 24 })),
+      h("label", {}, "TTL", h("input", { id: "n-ttl", type: "number", min: 1, max: 255, value: n.ttl }))
+    ),
+    h("div", { class: "actions" },
+      h("button", { id: "n-kill", class: "warn" }),
+      h("button", { id: "n-del", class: "danger", text: "删除节点" })
+    ),
+    h("p", { class: "hint", id: "n-note" }),
+    h("h3", { text: "发送" }),
+    h("div", { class: "sendbox" },
+      h("textarea", { id: "n-text", rows: 2, placeholder: "消息内容，Enter 发送 / Shift+Enter 换行" }),
+      h("div", { class: "sendrow" },
+        h("select", { id: "n-to" }),
+        h("label", { class: "chk" }, h("input", { id: "n-reliable", type: "checkbox" }), "可靠"),
+        h("button", { class: "primary", id: "n-send", text: "发送" })
+      )
+    ),
+    h("h3", { text: "收件箱" }),
+    h("div", { id: "n-inbox", class: "inbox" }),
+    h("h3", { text: "计数" }),
+    h("div", { id: "n-stats", class: "stats" }),
+    h("h3", {}, "路由 ", h("span", { id: "n-rcount", class: "muted" })),
+    h("div", { id: "n-routes", class: "table" })
+  );
+
+  $("#n-name").addEventListener("change", (e) =>
+    api(`/api/node/${n.id}`, "PATCH", { name: e.target.value }).then(poll));
+  $("#n-ttl").addEventListener("change", (e) =>
+    api(`/api/node/${n.id}`, "PATCH", { ttl: +e.target.value }).then(poll));
+  $("#n-kill").addEventListener("click", () =>
+    api(`/api/node/${n.id}`, "PATCH", { alive: !n.alive }).then(poll));
+  $("#n-del").addEventListener("click", () => {
+    if (!confirm(`删除 ${n.name}？`)) return;
+    api(`/api/node/${n.id}`, "DELETE").then(() => { S.sel = null; renderInspector(); poll(); });
+  });
+  $("#n-send").addEventListener("click", () => doSend(n));
+  $("#n-text").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doSend(n); }
+  });
+
+  fillTargets(n);
+  liveNode(n);
+}
+
+function linkInspector(box, l) {
+  const latMs = Math.round(l.latency * 1000);
+  const lossPct = Math.round(l.loss * 100);
+  box.append(
+    h("div", { class: "ihead" },
+      h("h2", { text: `${nodeName(l.a)} ↔ ${nodeName(l.b)}` }),
+      h("span", { id: "l-state", class: `chip ${l.up ? "ok" : "bad"}`, text: l.up ? "连通" : "断开" })
+    ),
+    h("div", { class: "rows" },
+      h("label", {}, "延迟",
+        h("input", { id: "l-lat", type: "range", min: 0, max: 400, step: 5, value: latMs }),
+        h("span", { id: "l-lat-v", class: "num", text: `${latMs} ms` })),
+      h("label", {}, "丢包",
+        h("input", { id: "l-loss", type: "range", min: 0, max: 90, step: 5, value: lossPct }),
+        h("span", { id: "l-loss-v", class: "num", text: `${lossPct}%` })),
+      h("label", { class: "chk" },
+        h("input", { id: "l-sup", type: "checkbox", checked: l.supervise }),
+        "断线自动重连（监督线程 + 指数退避）")
+    ),
+    h("div", { class: "actions" },
+      h("button", { id: "l-toggle", class: "warn" }),
+      h("button", { id: "l-del", class: "danger", text: "删除链路" })
+    ),
+    h("p", { class: "hint", text: "延迟和丢包立刻生效；切断后两端都会删掉经由该链路的路由，愈合后重新握手。" })
+  );
+
+  const lat = $("#l-lat");
+  const loss = $("#l-loss");
+  let timer = null;
+  const push = () => {
+    clearTimeout(timer);
+    timer = setTimeout(
+      () => api(`/api/link/${l.key}`, "PATCH", { latency: +lat.value / 1000, loss: +loss.value / 100 }),
+      80
+    );
+  };
+  lat.addEventListener("input", () => { $("#l-lat-v").textContent = `${lat.value} ms`; push(); });
+  loss.addEventListener("input", () => { $("#l-loss-v").textContent = `${loss.value}%`; push(); });
+  $("#l-sup").addEventListener("change", (e) =>
+    api(`/api/link/${l.key}`, "PATCH", { supervise: e.target.checked }));
+  $("#l-toggle").addEventListener("click", () =>
+    api(`/api/link/${l.key}`, "PATCH", { up: !l.up }).then(poll));
+  $("#l-del").addEventListener("click", () =>
+    api(`/api/link/${l.key}`, "DELETE").then(() => { S.sel = null; renderInspector(); poll(); }));
+
+  liveLink(l);
+}
+
+/* ------------------------------------------------------------ live update */
+
+function fillTargets(n) {
+  const sel = $("#n-to");
+  if (!sel) return;
+  const others = S.st.nodes.filter((o) => o.id !== n.id);
+  const sig = others.map((o) => o.id + o.name).join("|");
+  if (sel.dataset.sig === sig) return;
+  const prev = sel.value;
+  sel.innerHTML = "";
+  sel.append(h("option", { value: "", text: "广播（所有人）" }));
+  for (const o of others) {
+    sel.append(h("option", { value: o.id, text: o.name + (o.alive ? "" : " (已停)" ) }));
+  }
+  sel.dataset.sig = sig;
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+function liveNode(n) {
+  const kill = $("#n-kill");
+  if (kill) {
+    kill.textContent = n.alive ? "杀死节点" : "恢复节点";
+    kill.classList.toggle("danger", !n.alive);
+    kill.classList.toggle("warn", n.alive);
+  }
+  const name = $("#n-name");
+  if (name && document.activeElement !== name) name.value = n.name;
+
+  const note = $("#n-note");
+  if (note) {
+    note.textContent = n.alive
+      ? ""
+      : "节点已停止：它自己的路由表已清空，链路已断开。受监督的链路会在恢复后自动重连，其余需要手动重连。";
+  }
+
+  const rc = $("#n-rcount");
+  if (rc) rc.textContent = `${n.routes.length} 条 · ${n.links} 条链路 · ${n.pending} 待确认`;
+
+  const rt = $("#n-routes");
+  if (rt) {
+    if (!n.routes.length) {
+      rt.innerHTML = '<div class="muted">还没有路由（等通告收敛，或链路已断）</div>';
+    } else {
+      rt.innerHTML =
+        '<div class="tr th"><span>目标</span><span>跳</span><span>年龄</span></div>' +
+        n.routes.map((r) =>
+          `<div class="tr"><span>${esc(r.name || r.dst)}</span><span>${r.hops}</span><span>${r.age.toFixed(1)}s</span></div>`
+        ).join("");
+    }
+  }
+
+  const stt = $("#n-stats");
+  if (stt) {
+    stt.innerHTML = Object.entries(n.stats).map(([k, v]) =>
+      `<div><b>${v}</b><span>${STAT_LABELS[k] || k}</span></div>`
+    ).join("");
+  }
+
+  const ib = $("#n-inbox");
+  if (ib) {
+    const atBottom = ib.scrollHeight - ib.scrollTop - ib.clientHeight < 28;
+    if (!n.inbox.length) {
+      ib.innerHTML = '<div class="muted">收件箱是空的</div>';
+    } else {
+      ib.innerHTML = n.inbox.map((m) => `
+        <div class="msg ${m.broadcast ? "bc" : "dm"}">
+          <span class="who">${esc(m.from)}</span>
+          <span class="meta">${m.broadcast ? "广播" : "单播"} · ${m.hops}跳 · ${m.t.toFixed(2)}s</span>
+          <div class="txt">${esc(m.text)}</div>
+        </div>`).join("");
+    }
+    if (atBottom) ib.scrollTop = ib.scrollHeight;
+  }
+
+  fillTargets(n);
+}
+
+function liveLink(l) {
+  const chip = $("#l-state");
+  if (chip) {
+    chip.textContent = l.up ? "连通" : "断开";
+    chip.className = `chip ${l.up ? "ok" : "bad"}`;
+  }
+  const btn = $("#l-toggle");
+  if (btn) {
+    btn.textContent = l.up ? "切断链路" : "愈合链路";
+    btn.classList.toggle("danger", l.up);
+    btn.classList.toggle("warn", !l.up);
+  }
+}
+
+function liveInspector() {
+  if (!S.st || !S.sel) return;
+  if (S.sel.kind === "node") {
+    const n = S.st.nodes.find((x) => x.id === S.sel.id);
+    if (!n) { S.sel = null; renderInspector(); return; }
+    liveNode(n);
+  } else {
+    const l = S.st.links.find((x) => x.key === S.sel.id);
+    if (!l) { S.sel = null; renderInspector(); return; }
+    liveLink(l);
+  }
+}
+
+/* ------------------------------------------------------------------ send */
+
+async function doSend(n) {
+  const box = $("#n-text");
+  const text = box ? box.value.trim() : "";
+  if (!text) { flash("先输入消息内容"); return; }
+  const to = $("#n-to") ? $("#n-to").value : "";
+  const reliable = $("#n-reliable") ? $("#n-reliable").checked : false;
+  const ok = await api("/api/send", "POST", { from: n.id, to: to || null, text, reliable });
+  if (ok) { box.value = ""; poll(); }
+}
+
+/* ------------------------------------------------------------------ log */
+
+function appendLog(entries) {
+  const box = $("#log");
+  const pinned = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  const frag = document.createDocumentFragment();
+  for (const e of entries) {
+    const bad = /reject|fail|down|drop|drop/.test(e.tag);
+    frag.append(
+      h("div", { class: "lrow" },
+        h("span", { class: "lt", text: e.t.toFixed(2) }),
+        h("span", { class: "lw", text: e.who }),
+        h("span", { class: `ltag${bad ? " bad" : ""}`, text: e.tag }),
+        h("span", { class: "ld", text: e.detail })
+      )
+    );
+  }
+  box.append(frag);
+  while (box.childElementCount > 400) box.firstElementChild.remove();
+  if (pinned) box.scrollTop = box.scrollHeight;
+}
+
+/* ------------------------------------------------------------------ poll */
+
+let offline = false;
+function setOnline(ok) {
+  if (ok === !offline) return;
+  offline = !ok;
+  $("#offline").classList.toggle("show", offline);
+}
+
+async function poll() {
+  let st;
+  try {
+    st = await api(`/api/state?log_since=${S.logSeq}`);
+  } catch (e) {
+    setOnline(false);
+    return;
+  }
+  if (!st) return;
+  setOnline(true);
+  S.st = st;
+  S.logSeq = st.log_seq;
+  if (st.log.length) appendLog(st.log);
+  renderGraph();
+  renderTop();
+  liveInspector();
+}
+
+function renderTop() {
+  const st = S.st;
+  $("#clock").textContent = `${st.clock.toFixed(2)}s`;
+  const btn = $("#btn-run");
+  btn.textContent = st.running ? "⏸ 暂停" : "▶ 运行";
+  btn.classList.toggle("primary", !st.running);
+  const rate = $("#rate");
+  if (document.activeElement !== rate && +rate.value !== st.rate) rate.value = String(st.rate);
+}
+
+/* --------------------------------------------------------------- toolbar */
+
+$("#btn-run").addEventListener("click", () =>
+  api("/api/control", "POST", { running: !S.st.running }).then(poll));
+
+$("#btn-step").addEventListener("click", () =>
+  api("/api/control", "POST", { step: 0.25 }).then(poll));
+
+$("#rate").addEventListener("change", (e) =>
+  api("/api/control", "POST", { rate: +e.target.value }).then(poll));
+
+$("#btn-link").addEventListener("click", () => {
+  S.linkMode = !S.linkMode;
+  S.linkFrom = null;
+  $("#btn-link").classList.toggle("on", S.linkMode);
+  setHint(S.linkMode ? "连线模式：点两个节点" : "");
+  renderGraph();
+});
+
+$("#btn-add").addEventListener("click", () =>
+  api("/api/node", "POST", {}).then(() => poll()));
+
+$("#btn-apply").addEventListener("click", () => {
+  const kind = $("#preset").value;
+  const count = Math.max(2, Math.min(16, +$("#preset-count").value || 4));
+  S.sel = null;
+  S.logSeq = 0;
+  $("#log").innerHTML = "";
+  api("/api/preset", "POST", { kind, count }).then(() => { renderInspector(); poll(); });
+});
+
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (S.linkFrom) { S.linkFrom = null; setHint("已取消连线"); renderGraph(); }
+    else if (S.linkMode) { S.linkMode = false; $("#btn-link").classList.remove("on"); setHint(""); }
+    else clearSel();
+  }
+});
+
+/* ----------------------------------------------------------------- boot */
+
+poll().then(renderInspector);
+setInterval(poll, 120);
+</script>
+</body>
+</html>

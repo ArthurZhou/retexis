@@ -1,0 +1,9 @@
+[package]
+name = "retexis-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Zero-dependency SHA-256, HMAC-SHA256 and the envelope sealer"
+
+[dependencies]

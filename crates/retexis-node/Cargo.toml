@@ -1,0 +1,18 @@
+[package]
+name = "retexis-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "retexis node daemon / chat CLI"
+
+[[bin]]
+name = "retexis"
+path = "src/main.rs"
+
+[dependencies]
+retexis-core.workspace = true
+retexis-crypto.workspace = true
+retexis-link-tcp.workspace = true
+retexis-routing.workspace = true
+retexis-app.workspace = true

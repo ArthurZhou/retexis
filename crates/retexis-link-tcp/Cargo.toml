@@ -1,0 +1,10 @@
+[package]
+name = "retexis-link-tcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Plain TCP medium for retexis"
+
+[dependencies]
+retexis-core.workspace = true
