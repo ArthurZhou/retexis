@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Interactive mesh simulator: JSON API + a single-page UI.
+"""Reference-model simulator: JSON API + the shared single-page UI.
 
     python sim/server.py                 # http://127.0.0.1:8770
     python sim/server.py --port 9000 --nodes 6 --preset ring
 
-The browser is only a view and a controller. Every protocol decision still
-happens in `retexis/` — the same code the scenario runner uses — so what you
-see on screen is the real simulator, not a re-implementation for the demo.
+    NOTE: `cargo run -p retexis-sim` is the simulator you probably want. It
+    drives the *production* routers over a virtual switch, so it cannot drift
+    from the shipped protocol. This server drives the Python re-implementation
+    in `sim/retexis/` instead — a second implementation kept on purpose, to
+    check the wire format and to run statistical scenarios fast.
+
+    It serves the same API and the same HTML, which is what makes the two
+    engines comparable: same screen, different code underneath.
+
+The browser is only a view and a controller. Every protocol decision happens
+in `sim/retexis/` (the model), not in this file.
 
 Concurrency: the simulator is single-threaded by design (it is a discrete event
 queue). One lock guards it. The tick thread advances simulated time at

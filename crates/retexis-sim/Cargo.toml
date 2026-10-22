@@ -1,0 +1,17 @@
+[package]
+name = "retexis-sim"
+description = "Interactive mesh simulator: real routers, a virtual switch, a web UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+retexis-core.workspace = true
+retexis-routing.workspace = true
+retexis-app.workspace = true
+
+[[bin]]
+name = "retexis-sim"
+path = "src/main.rs"

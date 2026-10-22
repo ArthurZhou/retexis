@@ -123,6 +123,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "retexis-sim"
+version = "0.1.0"
+dependencies = [
+ "retexis-app",
+ "retexis-core",
+ "retexis-routing",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

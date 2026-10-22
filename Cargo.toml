@@ -7,6 +7,7 @@ members = [
     "crates/retexis-routing",
     "crates/retexis-app",
     "crates/retexis-node",
+    "crates/retexis-sim",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ retexis-crypto = { path = "crates/retexis-crypto" }
 retexis-link-tcp = { path = "crates/retexis-link-tcp" }
 retexis-routing = { path = "crates/retexis-routing" }
 retexis-app = { path = "crates/retexis-app" }
+retexis-sim = { path = "crates/retexis-sim" }
 
 [profile.release]
 opt-level = 3
