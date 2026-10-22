@@ -1,5 +1,8 @@
 //! Argument parsing. Hand rolled: a handful of flags do not justify a
 //! dependency.
+//!
+//! Note what is *not* here: no defaults for media, no knowledge of how a link
+//! is opened. This only turns argv into a value.
 
 use retexis_core::NodeId;
 use retexis_crypto::Sealer;
@@ -22,6 +25,16 @@ pub struct Options {
     pub flood_burst: f64,
     pub flood_limit: bool,
     pub reconnect: bool,
+    /// Broadcast a discovery query at startup and print what answers.
+    pub discover: bool,
+    /// How long to listen for answers.
+    pub discover_ms: u64,
+    /// Dial everything discovery finds.
+    pub discover_connect: bool,
+    /// Answer other nodes' discovery queries with our listen endpoints.
+    pub announce: bool,
+    /// UDP port used by IP broadcast discovery.
+    pub discovery_port: u16,
 }
 
 impl Default for Options {
@@ -42,6 +55,11 @@ impl Default for Options {
             flood_burst: 100.0,
             flood_limit: true,
             reconnect: true,
+            discover: false,
+            discover_ms: 800,
+            discover_connect: false,
+            announce: false,
+            discovery_port: retexis_core::DEFAULT_PORT,
         }
     }
 }
@@ -80,18 +98,34 @@ FLOOD CONTROL:
     --flood-burst <n>        Allowed burst above that rate (100)
     --no-flood-limit         Disable suppression (shows the storm)
 
+DISCOVERY:
+    --discover               Broadcast a query at startup and print what answers
+    --discover-ms <n>        How long to listen for answers (default 800)
+    --discover-connect       Dial everything discovery finds
+    --announce               Answer other nodes' discovery queries
+    --discovery-port <n>     UDP port for discovery (default 47700)
+
     -h, --help               Show this help
 
 URLS:
-    tcp://host:port          plain TCP (the only medium compiled in today)
+    tcp://host:port          plain TCP (stream, framed with a length prefix)
+    udp://host:port          UDP (one datagram per envelope, lossy)
+    hub://                   simulated switch (only in `retexis-sim`)
+
+    Discovery is IP broadcast over UDP whatever the medium: a node that listens
+    on tcp:// announces \"tcp://1.2.3.4:7100\" over a broadcast datagram, because
+    TCP itself cannot broadcast. Media that cannot broadcast at all report
+    \"nobody found\" instead of failing.
 
 EXAMPLES:
-    retexis --name alice --listen tcp://0.0.0.0:7100 --psk \"our secret\"
-    retexis --name bob   --connect tcp://127.0.0.1:7100 --psk \"our secret\"
+    retexis --name alice --listen tcp://0.0.0.0:7100 --announce
+    retexis --name bob   --discover --discover-connect
 
 REPL:
     <text>                   broadcast to the mesh on the chat channel
     /msg <peer|id> <text>    reliable unicast (acked, retransmitted)
+    /connect <url>           dial an address you already know
+    /discover [ms]           ask the local network who is out there
     /peers /routes /status /id /kick /help /quit
 ";
 
@@ -126,6 +160,28 @@ impl Options {
                 "--listen" => opts.listen.push(value(&mut args, "--listen")),
                 "--connect" => opts.connect.push(value(&mut args, "--connect")),
                 "--no-reconnect" => opts.reconnect = false,
+                "--discover" => opts.discover = true,
+                "--discover-connect" => {
+                    opts.discover = true;
+                    opts.discover_connect = true;
+                }
+                "--discover-ms" => {
+                    opts.discover_ms = parse_num(
+                        &value(&mut args, "--discover-ms"),
+                        "--discover-ms",
+                        20,
+                        60_000,
+                    )
+                }
+                "--announce" => opts.announce = true,
+                "--discovery-port" => {
+                    opts.discovery_port = parse_num(
+                        &value(&mut args, "--discovery-port"),
+                        "--discovery-port",
+                        1,
+                        65_535,
+                    ) as u16
+                }
                 "--no-flood-limit" => opts.flood_limit = false,
                 "--ttl" => opts.ttl = parse_num(&value(&mut args, "--ttl"), "--ttl", 1, 255) as u8,
                 "--announce-ms" => {

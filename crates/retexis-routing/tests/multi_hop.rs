@@ -13,7 +13,7 @@ const CHAT: &str = "chat";
 
 fn registry() -> TransportRegistry {
     let mut reg = TransportRegistry::new();
-    reg.register(Box::new(TcpFactory::new()));
+    reg.register(std::sync::Arc::new(TcpFactory::new()));
     reg
 }
 

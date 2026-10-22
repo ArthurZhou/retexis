@@ -77,6 +77,11 @@ name = "retexis-app"
 version = "0.1.0"
 dependencies = [
  "retexis-core",
+ "retexis-crypto",
+ "retexis-data",
+ "retexis-discovery",
+ "retexis-link-tcp",
+ "retexis-link-udp",
  "retexis-routing",
 ]
 
@@ -96,10 +101,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "retexis-data"
+version = "0.1.0"
+dependencies = [
+ "retexis-core",
+ "retexis-link-tcp",
+ "retexis-routing",
+]
+
+[[package]]
+name = "retexis-discovery"
+version = "0.1.0"
+dependencies = [
+ "retexis-core",
+]
+
+[[package]]
 name = "retexis-link-tcp"
 version = "0.1.0"
 dependencies = [
  "retexis-core",
+ "retexis-discovery",
+]
+
+[[package]]
+name = "retexis-link-udp"
+version = "0.1.0"
+dependencies = [
+ "retexis-core",
+ "retexis-discovery",
 ]
 
 [[package]]
@@ -107,10 +137,6 @@ name = "retexis-node"
 version = "0.1.0"
 dependencies = [
  "retexis-app",
- "retexis-core",
- "retexis-crypto",
- "retexis-link-tcp",
- "retexis-routing",
 ]
 
 [[package]]
@@ -120,14 +146,15 @@ dependencies = [
  "retexis-core",
  "retexis-crypto",
  "retexis-link-tcp",
+ "retexis-link-udp",
 ]
 
 [[package]]
 name = "retexis-sim"
 version = "0.1.0"
 dependencies = [
- "retexis-app",
  "retexis-core",
+ "retexis-data",
  "retexis-routing",
 ]
 

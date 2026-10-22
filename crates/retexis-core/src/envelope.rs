@@ -154,6 +154,18 @@ impl ContentType {
         })
     }
 
+    /// True for the three types that carry stream traffic.
+    ///
+    /// A relay never asks: it only forwards envelopes. This exists for the
+    /// data layer, which has to tell "one message" from "part of a longer one"
+    /// without keeping per-stream state in the router.
+    pub fn is_stream(self) -> bool {
+        matches!(
+            self,
+            ContentType::StreamOpen | ContentType::StreamChunk | ContentType::StreamClose
+        )
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             ContentType::Text => "text",

@@ -4,8 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Application transports on top of the mesh: chat today, binary and streaming next"
+description = "Application layer: chat, terminal, and the retexis CLI"
 
 [dependencies]
 retexis-core.workspace = true
+retexis-crypto.workspace = true
+retexis-data.workspace = true
 retexis-routing.workspace = true
+retexis-discovery.workspace = true
+retexis-link-tcp.workspace = true
+retexis-link-udp.workspace = true

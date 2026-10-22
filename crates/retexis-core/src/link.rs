@@ -12,9 +12,16 @@
 //!
 //! Adding a medium therefore never touches the router: implement [`Link`] +
 //! [`LinkAcceptor`] + [`LinkFactory`] and register the scheme.
+//!
+//! A medium may also be able to find peers by itself; that is the optional
+//! [`LinkFactory::beacon`] capability. It defaults to
+//! [`NoBroadcast`](crate::NoBroadcast), so a point-to-point medium compiles
+//! and answers "nobody found" instead of forcing every implementation to care.
 
+use crate::discovery::{Beacon, NoBroadcast};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub type LinkId = u64;
 
@@ -132,13 +139,27 @@ pub trait LinkFactory: Send + Sync {
     fn listen(&self, addr: &str) -> Result<Box<dyn LinkAcceptor>, LinkError>;
 
     fn connect(&self, addr: &str) -> Result<Box<dyn Link>, LinkError>;
+
+    /// How peers on this medium can be found without being told an address.
+    ///
+    /// The default says "not possible": a point-to-point medium cannot ask
+    /// "who is out there?". Media that can — IP broadcast, a radio channel
+    /// with a shared frequency — override this and return a real
+    /// [`Beacon`].
+    fn beacon(&self) -> Box<dyn Beacon> {
+        Box::new(NoBroadcast::new(self.scheme()))
+    }
 }
 
 /// Scheme -> factory map, so `--listen tcp://0.0.0.0:7100` is resolved at
-/// runtime. Adding `ws://` later is one `register` call at startup.
+/// runtime. Adding `udp://` later is one `register` call at startup.
+///
+/// Factories are shared (`Arc`) rather than owned because more than one caller
+/// needs one at a time: the listener path, and every supervised dialer, which
+/// lives on its own thread and must own what it uses.
 #[derive(Default)]
 pub struct TransportRegistry {
-    factories: Vec<Box<dyn LinkFactory>>,
+    factories: Vec<Arc<dyn LinkFactory>>,
 }
 
 impl TransportRegistry {
@@ -148,7 +169,7 @@ impl TransportRegistry {
         }
     }
 
-    pub fn register(&mut self, factory: Box<dyn LinkFactory>) {
+    pub fn register(&mut self, factory: Arc<dyn LinkFactory>) {
         self.factories.push(factory);
     }
 
@@ -156,11 +177,24 @@ impl TransportRegistry {
         self.factories.iter().map(|f| f.scheme()).collect()
     }
 
-    fn factory(&self, scheme: &str) -> Result<&dyn LinkFactory, LinkError> {
+    /// The factory for a URL's scheme.
+    ///
+    /// This is what keeps the dial path honest: `--connect udp://...` must
+    /// resolve to the UDP factory, not to whichever medium happened to be
+    /// hardcoded at the call site.
+    pub fn factory_for(&self, url: &str) -> Option<Arc<dyn LinkFactory>> {
+        let (scheme, _) = split_url(url).ok()?;
         self.factories
             .iter()
             .find(|f| f.scheme() == scheme)
-            .map(|b| b.as_ref())
+            .map(Arc::clone)
+    }
+
+    fn factory(&self, scheme: &str) -> Result<Arc<dyn LinkFactory>, LinkError> {
+        self.factories
+            .iter()
+            .find(|f| f.scheme() == scheme)
+            .map(Arc::clone)
             .ok_or_else(|| {
                 LinkError::Framing(format!(
                     "no transport registered for scheme '{scheme}' (have: {})",
@@ -177,6 +211,22 @@ impl TransportRegistry {
     pub fn connect(&self, url: &str) -> Result<Box<dyn Link>, LinkError> {
         let (scheme, addr) = split_url(url)?;
         self.factory(scheme)?.connect(addr)
+    }
+
+    /// The discovery beacon of one scheme, or `None` when it is not registered.
+    pub fn beacon_for(&self, scheme: &str) -> Option<Box<dyn Beacon>> {
+        self.factories
+            .iter()
+            .find(|f| f.scheme() == scheme)
+            .map(|f| f.beacon())
+    }
+
+    /// Every registered medium's beacon, in registration order.
+    ///
+    /// Media that cannot broadcast are included: their beacons return `0` and
+    /// an empty list, so a caller can iterate without filtering.
+    pub fn beacons(&self) -> Vec<Box<dyn Beacon>> {
+        self.factories.iter().map(|f| f.beacon()).collect()
     }
 }
 
@@ -209,5 +259,49 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("no transport registered"));
+        assert!(reg.factory_for("ws://x").is_none());
+        assert!(reg.beacon_for("ws").is_none());
+    }
+
+    /// A stand-in medium: enough to prove the registry resolves by scheme and
+    /// that the default beacon answers "cannot broadcast".
+    struct Dummy(&'static str);
+
+    impl LinkFactory for Dummy {
+        fn scheme(&self) -> &'static str {
+            self.0
+        }
+        fn listen(&self, _addr: &str) -> Result<Box<dyn LinkAcceptor>, LinkError> {
+            Err(LinkError::Framing("dummy".into()))
+        }
+        fn connect(&self, _addr: &str) -> Result<Box<dyn Link>, LinkError> {
+            Err(LinkError::Framing("dummy".into()))
+        }
+    }
+
+    #[test]
+    fn the_default_beacon_cannot_broadcast() {
+        let mut reg = TransportRegistry::new();
+        reg.register(Arc::new(Dummy("p2p")));
+        let beacon = reg.beacon_for("p2p").expect("registered");
+        assert_eq!(beacon.scheme(), "p2p");
+        assert!(!beacon.can_broadcast());
+        assert_eq!(beacon.broadcast(&crate::Announcement::query()).unwrap(), 0);
+        assert!(beacon
+            .discover(std::time::Duration::from_millis(1))
+            .unwrap()
+            .is_empty());
+        assert_eq!(reg.beacons().len(), 1);
+    }
+
+    #[test]
+    fn factory_for_resolves_by_scheme() {
+        let mut reg = TransportRegistry::new();
+        reg.register(Arc::new(Dummy("a")));
+        reg.register(Arc::new(Dummy("b")));
+        assert_eq!(reg.factory_for("a://x:1").unwrap().scheme(), "a");
+        assert_eq!(reg.factory_for("b://x:1").unwrap().scheme(), "b");
+        assert!(reg.factory_for("a//x").is_none(), "not a url");
+        assert_eq!(reg.schemes(), vec!["a", "b"]);
     }
 }

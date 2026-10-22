@@ -24,7 +24,7 @@ impl Server {
         sim.reset(preset, count);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap().to_string();
-        let web = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sim/web");
+        let web = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web");
         let served = Arc::clone(&sim);
         std::thread::spawn(move || {
             let _ = http::serve_listener(listener, served, web);

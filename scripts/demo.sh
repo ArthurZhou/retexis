@@ -34,7 +34,7 @@ sleep 1
 sleep 1
 
 # carol: two hops away from alice. Unicasts to alice by name.
-( sleep 2; echo "carol here, two hops away"; sleep 1; echo "/routes"; sleep 2; \
+( sleep 2; echo "carol here, two hops away"; sleep 1; echo "/net"; sleep 0.4; echo "/routes"; sleep 2; \
   echo "/msg alice hello alice, this is a unicast that bob forwarded"; sleep 2; echo "/quit" ) \
     | "$BIN" --name carol --connect "tcp://127.0.0.1:$PORT_B" >"$OUT/carol.log" 2>&1 &
 

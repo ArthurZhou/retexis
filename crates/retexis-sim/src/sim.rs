@@ -10,12 +10,12 @@
 //! 2. presentation state — node positions, an inbox per node, an event log.
 //!
 //! That split is deliberate: positions are not protocol, so they never leak
-//! into a router. The Python simulator kept the same boundary, and the fact
-//! that this one can reuse the production router is the payoff.
+//! into a router — and the router never learns it is being simulated. The
+//! payoff is that `retexis-routing` needed **zero** changes to become
+//! interactive: the whole medium contract is the `Link` trait.
 
 use crate::hub::{Hub, LinkKey, LinkParams, LinkView};
 use crate::json::Json;
-use retexis_app::CHAT_CHANNEL;
 use retexis_core::{ContentType, NodeId};
 use retexis_routing::{Delivery, MeshHandle, MeshStatus, RouterConfig, RouterNotice};
 use std::collections::VecDeque;
@@ -36,6 +36,11 @@ const NAMES: [&str; 16] = [
 const INBOX_CAP: usize = 200;
 /// How many log lines the UI can page through.
 const LOG_CAP: usize = 600;
+
+/// The chat channel name. The simulator speaks the same channel as the CLI,
+/// but it deliberately does **not** depend on `retexis-app`: a simulated
+/// medium must not drag in real media or a terminal.
+const CHAT_CHANNEL: &str = "chat";
 
 /// Counters the inspector shows, in display order.
 const STAT_KEYS: [&str; 10] = [

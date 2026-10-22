@@ -12,3 +12,4 @@ retexis-crypto.workspace = true
 
 [dev-dependencies]
 retexis-link-tcp.workspace = true
+retexis-link-udp.workspace = true

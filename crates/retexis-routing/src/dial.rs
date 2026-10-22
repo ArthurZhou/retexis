@@ -16,6 +16,7 @@
 
 use crate::{MeshHandle, NoticeSink, RouterNotice};
 use retexis_core::{split_url, LinkFactory};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -43,14 +44,16 @@ impl Default for ReconnectConfig {
 
 /// A supervised outbound connection.
 pub struct Dialer {
-    factory: Box<dyn LinkFactory>,
+    /// Shared with the registry: one factory can serve several dialers, each
+    /// on its own thread, without cloning the medium.
+    factory: Arc<dyn LinkFactory>,
     url: String,
     addr: String,
     cfg: ReconnectConfig,
 }
 
 impl Dialer {
-    pub fn new(factory: Box<dyn LinkFactory>, url: &str) -> Result<Self, String> {
+    pub fn new(factory: Arc<dyn LinkFactory>, url: &str) -> Result<Self, String> {
         let (_, addr) = split_url(url).map_err(|e| e.to_string())?;
         Ok(Dialer {
             factory,
@@ -184,7 +187,7 @@ mod tests {
     #[test]
     fn backoff_grows_and_is_capped() {
         let d = Dialer {
-            factory: Box::new(retexis_link_tcp::TcpFactory::new()),
+            factory: Arc::new(retexis_link_tcp::TcpFactory::new()),
             url: "tcp://x:1".into(),
             addr: "x:1".into(),
             cfg: ReconnectConfig {

@@ -458,7 +458,7 @@ fn a_relay_reforwards_a_retried_unicast() {
 #[test]
 fn the_dialer_reconnects_after_the_link_is_dropped() {
     let mut registry = TransportRegistry::new();
-    registry.register(Box::new(TcpFactory::new()));
+    registry.register(std::sync::Arc::new(TcpFactory::new()));
 
     let (listener, _l_rx) = node("listener", |_| {});
     let acceptor = registry.listen("tcp://127.0.0.1:0").expect("bind");
@@ -466,14 +466,17 @@ fn the_dialer_reconnects_after_the_link_is_dropped() {
     listener.accept_from(acceptor).expect("accept loop");
 
     let (dialer_node, _d_rx) = node("dialer", |_| {});
-    let dialer = Dialer::new(Box::new(TcpFactory::new()), &format!("tcp://{addr}"))
-        .expect("dialer")
-        .with_config(ReconnectConfig {
-            enabled: true,
-            base: Duration::from_millis(50),
-            max: Duration::from_millis(200),
-            probe: Duration::from_millis(50),
-        });
+    let dialer = Dialer::new(
+        std::sync::Arc::new(TcpFactory::new()),
+        &format!("tcp://{addr}"),
+    )
+    .expect("dialer")
+    .with_config(ReconnectConfig {
+        enabled: true,
+        base: Duration::from_millis(50),
+        max: Duration::from_millis(200),
+        probe: Duration::from_millis(50),
+    });
     dialer.spawn(dialer_node.clone(), retexis_routing::silent());
 
     assert!(
@@ -513,7 +516,7 @@ fn the_dialer_reconnects_after_the_link_is_dropped() {
 #[test]
 fn two_nodes_dialling_each_other_end_up_with_one_link() {
     let mut registry = TransportRegistry::new();
-    registry.register(Box::new(TcpFactory::new()));
+    registry.register(std::sync::Arc::new(TcpFactory::new()));
 
     let (a, _a_rx) = node("a", |_| {});
     let (b, _b_rx) = node("b", |_| {});

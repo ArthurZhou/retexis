@@ -19,7 +19,9 @@ alice <--tcp--> bob <--tcp--> carol      alice 和 carol 之间没有连接
 
 | 能力 | 做法 |
 |---|---|
-| **硬件解耦** | `Link` trait 拥有分帧权，路由层只交出字节；`tcp://` 只是注册表里的一个 scheme |
+| **硬件解耦** | `Link` trait 拥有分帧权，路由层只交出字节；`tcp://` / `udp://` 只是注册表里的两个 scheme |
+| **介质** | TCP（长度前缀分帧）· UDP（一包一帧，无分帧）· 模拟交换机；路由层为加介质改 0 行 |
+| **发现** | IP 广播（UDP）问"谁在"，应答里带各自的 `tcp://` / `udp://` 端点；不能广播的介质返回空 |
 | **路由** | 距离矢量 + 水平分割 + 去重 + TTL，多跳单播、广播泛洪 |
 | **认证** | 预共享密钥，每个包带截断 HMAC-SHA256；解析前过滤，坏包进不了解码器 |
 | **重连** | 每条 `--connect` 一个监督线程，指数退避 + 抖动，链路死了自动重拨 |
@@ -27,7 +29,6 @@ alice <--tcp--> bob <--tcp--> carol      alice 和 carol 之间没有连接
 | **泛洪抑制** | 令牌桶（全局 + 按来源），默认预算在聊天负载下永不触发 |
 | **模拟器** | `retexis-sim`：每个节点就是一个真 Router 线程，一台虚拟交换机按网页配置插拔链路 |
 | **可视化编辑器** | 浏览器里拖节点、连链路、改延迟丢包、按节点收发消息，看真实路由表收敛 |
-| **参考模型** | `sim/`：Python 第二实现，9 个场景秒级跑完，与 Rust 字节级互通 |
 
 ---
 
@@ -47,6 +48,17 @@ cargo build --release
 ./target/release/retexis --name carol --connect tcp://127.0.0.1:7101 --psk "our secret"
 ```
 
+不想手打地址时，广播发现一步到位：
+
+```bash
+# alice 应答发现请求，把自己两个端点都报出去
+./target/release/retexis --name alice --listen tcp://0.0.0.0:7100 \
+    --listen udp://0.0.0.0:7101 --announce --psk "our secret"
+
+# bob 不给地址：广播问一句，连上所有应答者
+./target/release/retexis --name bob --discover --discover-connect --psk "our secret"
+```
+
 然后在 carol 里：
 
 ```
@@ -56,15 +68,44 @@ hello mesh                                    # 广播，两跳后到达 alice
 /peers                                        # 物理链路：介质、方向、对端身份
 /status                                       # 计数器：转发/泛洪/去重/重传/认证拒绝
 /kick bob                                     # 踢掉链路，看监督线程把它接回来
+/net                                          # 网络视图：每条链路 + 通过它可达的节点
+/stream bob 一段很长的文本                     # 走流式通道（open/chunk/close）
+/connect udp://10.0.0.7:7101                  # 运行中连一个新地址
+/discover 400                                 # 广播问一句：400ms 内谁应答
 ```
 
 去掉 `--psk` 就是明文模式（开发用）。带 `--psk` 时，密钥不对的节点连握手都过不去。
 
-两个一键演示：
+### 连接到一个已知地址
+
+三种方式，走的是同一条拨号路径（`Connector`），介质由 URL 的 scheme 决定：
+
+| 场景 | 写法 |
+|---|---|
+| 启动就连 | `--connect tcp://10.0.0.7:7100`，可重复，可混介质 |
+| 运行中连 | REPL `/connect udp://10.0.0.7:7101` |
+| 不知道地址 | `--discover --discover-connect`，或 `/discover` 先看一眼 |
 
 ```bash
-./scripts/demo.sh        # 三节点链式拓扑：多跳广播 + 单播
-./scripts/demo-auth.sh   # 认证 + 踢链路 + 自动重连（含一个错误密钥的入侵者）
+retexis --name bob --connect tcp://10.0.0.7:7100 --connect udp://10.0.0.7:7101
+```
+
+- 默认**受监督**：断了按指数退避重拨（250ms 起，翻倍，封顶 15s，±25% 抖动）。
+  `--no-reconnect` 只试一次，失败就报 `! dial ...` 并放弃。
+- **URL 必须带 scheme**。`--connect 127.0.0.1:7100` 会报
+  `no medium for '127.0.0.1:7100' (have: tcp, udp)`——介质是从注册表按 scheme 查的，
+  不猜。
+- 同一个地址重复给（或发现结果和 `--connect` 撞了）只会拨一次。
+- 连上不等于通了：还要看 `/peers` 有没有 `link up`、`/routes` 里有没有对方。
+  握手成功但密钥不对，会在 `/status` 里看到 `auth_rejected` 增长。
+
+四个一键演示：
+
+```bash
+./scripts/demo.sh            # 三节点链式拓扑：多跳广播 + 单播
+./scripts/demo-auth.sh       # 认证 + 踢链路 + 自动重连（含一个错误密钥的入侵者）
+./scripts/demo-udp.sh        # 同一套协议跑在 UDP 上
+./scripts/demo-discovery.sh  # 一个节点应答发现，另一个不给地址就找到它
 ```
 
 `demo-auth.sh` 的真实输出节选 —— bob 的视角：
@@ -92,9 +133,11 @@ reliable  acked 1   failed 0   retransmits 0
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ retexis-app       传输层    "这些字节是什么意思"                     │
-│   Transport trait · 按 channel 分发 · ChatTransport(文本)             │
-│   之后: 文件/二进制通道 · 流式通道(StreamChunk 已在信封里预留)         │
+│ retexis-app       应用层    "人怎么用它"                             │
+│   CLI/REPL · 表格与网络树渲染 · chat 应用（一个 DataSink）            │
+├──────────────────────────────────────────────────────────────────────┤
+│ retexis-data      数据层    "这些字节是什么意思"                     │
+│   Frame(一帧一条消息) · Stream(open/chunk/close + 重组) · DataHost    │
 ├──────────────────────────────────────────────────────────────────────┤
 │ retexis-routing   路由层    "这些字节该去哪 / 能不能信任"            │
 │   NodeId · 距离矢量路由表 · 单播/泛洪 · 去重 · TTL · 认证过滤         │
@@ -105,7 +148,11 @@ reliable  acked 1   failed 0   retransmits 0
 │   TransportRegistry: 按 URL scheme 找介质                             │
 ├──────────────────────────────────────────────────────────────────────┤
 │ retexis-link-tcp  介质层    "字节怎么动"                             │
-│   长度前缀分帧 · 读写分离 · 之后: http / ws / radio                   │
+│   长度前缀分帧 · 读写分离                                             │
+│ retexis-link-udp  介质层                                              │
+│   一包一帧（不分帧）· 一个 socket 多对端（demux）                     │
+│ retexis-discovery 发现      "附近有谁"                                │
+│   UDP 广播查询/应答 · 给任何介质提供 Beacon                           │
 └──────────────────────────────────────────────────────────────────────┘
          retexis-crypto：Sealer 封装 HMAC-SHA256（RustCrypto 纯 Rust 实现）
 ```
@@ -115,9 +162,13 @@ reliable  acked 1   failed 0   retransmits 0
 - **路由层永远不解析 payload**，传输层永远不看路由头。
 - **介质层拥有分帧权**。路由层只交给它一段已编码的信封字节，怎么放上介质由它决定
   （流式介质加长度前缀，数据报介质一包一帧，窄带介质自己切块）。这就是解耦点。
+- **数据层不知道介质，应用层不知道协议**。`retexis-data` 里没有 socket、没有终端；
+  `retexis-app` 里没有线格式、没有 channel 号。加一个 `pty` 应用只需写一个 `DataSink`。
 - **认证是字节流上的过滤器**，在 `Envelope::decode` 之前跑，坏包根本进不了解码器。
-- 每层都能单独测试：55 个 Rust 测试 + 9 个模拟场景，其中包含真实 TCP 的多跳/环网/断链、
-  确定性丢包链路、四链路并发重连。
+- **介质能力是可选的**。`LinkFactory::beacon()` 默认返回 `NoBroadcast`（`broadcast` 回 0、
+  `discover` 回空表），所以点对点介质不用为"不能广播"写任何代码，调用方也不用特判。
+- 每层都能单独测试：161 个 Rust 测试，其中包含真实 TCP/UDP 的多跳、环网、断链、确定性丢包
+  链路、四链路并发重连、跨两个真路由器的 64 KiB 流式传输，以及**读 Cargo.toml 的解耦约束测试**。
 
 ## crate 地图
 
@@ -125,10 +176,13 @@ reliable  acked 1   failed 0   retransmits 0
 |---|---|---|
 | `retexis-core` | 线格式、ID、`Link` 抽象、介质注册表 | 无 |
 | `retexis-crypto` | 信封密封（RustCrypto `sha2` + `hmac`） | 纯 Rust，无 C |
-| `retexis-link-tcp` | TCP 介质 | core |
+| `retexis-discovery` | IP 广播发现（查询/应答），给所有介质共用 | core |
+| `retexis-link-tcp` | TCP 介质（流，长度前缀分帧） | core, discovery |
+| `retexis-link-udp` | UDP 介质（数据报，一包一帧，多对端 demux） | core, discovery |
 | `retexis-routing` | 路由表、转发、去重、限流、重传、拨号器 | core, crypto |
-| `retexis-app` | `Transport` trait、chat 通道、终端输出 | core, routing |
-| `retexis-node` | 二进制 `retexis`：参数解析 + REPL | 全部 |
+| `retexis-data` | 帧、流、channel 分发（协议部分） | core, routing |
+| `retexis-app` | 应用层：CLI、REPL、渲染、chat | core, data, routing, crypto, discovery, link-* |
+| `retexis-node` | 二进制 `retexis`，10 行入口 | app |
 | `retexis-sim` | 模拟器：虚拟交换机 + JSON API + 单页 UI | core, routing, app |
 
 ## 线格式（v2）
@@ -164,6 +218,124 @@ offset  size  field
 
 `content_type` 已经预留了 `Binary` / `StreamOpen` / `StreamChunk` / `StreamClose`，
 所以将来加二进制和流式传输 **不需要改线格式**。
+
+## 数据层：帧与流
+
+路由层只搬字节。`retexis-data` 决定这些字节**是什么**，而形状只有两种：
+
+| 形状 | 用在哪 | 线上表现 |
+|---|---|---|
+| **帧** `Frame` | 一条聊天消息、一次指标上报、一个按键 | 一个信封装完，`content_type = Text/Binary/Json` |
+| **流** `Stream` | 传文件、终端会话、任何装不下的东西 | `StreamOpen` → N×`StreamChunk` → `StreamClose` |
+
+两者共用同一条 channel 和同一个信封格式——`content_type` 就是判别位。这意味着**中继不需要
+知道什么是流**：它只看到一串 `Body::Data`，照常转发、去重、限流。
+
+### 流为什么把 id 放在 payload 里
+
+信封头里没有"这是哪条流"的位置，也不该有：一旦有，每个转发节点都得维护流状态。放在
+payload 里的代价是接收端自己拆，好处是一条 4 MB 的文件能穿过三个完全不懂流的中继。
+
+```
+StreamOpen   payload = u64 id | u8 name_len | name
+StreamChunk  payload = u64 id | u32 seq      | data
+StreamClose  payload = u64 id | u32 chunks
+```
+
+### 接收端：`StreamAssembler`
+
+它做四件不那么显然的事：
+
+- **乱序重组**：UDP 上 chunk 会乱序，按 seq 缓冲，凑齐连续段再交付给 sink。
+- **丢 `Open` 不死**：收到未知流的 chunk 就隐式建流（名字为空）。否则丢一个包整个传输就废了。
+- **丢 `Close` 不假成功**：`Close` 到了但还有缺口，报 `Dropped{MissingChunks}`，而不是假装收完。
+- **重复不重投**：`seq < next` 直接丢弃。重传是路由器的事，投递一次是数据层的事。
+
+键是 `(发送方 NodeId, stream id)`，所以两个节点可以碰巧用同一个 id 而不互相干扰。
+
+### 一个真实的例子
+
+```
+carol> /stream bob 这是一段被切成多个 chunk 的流式消息
+· stream d188bd90 → bob: 49 bytes in 3 chunks
+
+bob>  … stream d188bd90 'text' opened
+      … stream d188bd90 24 bytes
+      … stream d188bd90 24 bytes
+      … stream d188bd90 1 byte
+      … stream d188bd90 closed (49 bytes)
+```
+
+`/stream` 故意把 chunk 切得很小（24 字节），否则一条 49 字节的消息永远只有一个 chunk，
+流式路径等于没测。
+
+### 刻意没做的
+
+- **没有流控**。快发送方能把慢接收方冲垮，接收方丢弃并报 `Dropped`。真正的背压需要信用窗口，
+  而信用窗口需要路由器暴露队列深度——现在没有。
+- **没有 per-stream 重传**。`StreamSender::open_reliable` 让每个 chunk 成为被 ack 的单播，
+  代价是 N 个 ack。广播流没有这个选项（ack 广播会变成 N 份）。
+- **没有压缩、没有加密**（加密在信封层，还没做）。
+
+---
+
+## 介质与发现
+
+### 三种介质，一套 `Link`
+
+| scheme | 分帧 | 特点 |
+|---|---|---|
+| `tcp://` | 4 字节长度前缀 | 可靠有序，适合跨公网；粘包/半包由介质处理 |
+| `udp://` | 无（一包一帧） | 会丢、会乱序、无连接；延迟低，适合局域网和窄带 |
+| `hub://` | 无 | 只在 `retexis-sim` 里：虚拟交换机，网页可插拔 |
+
+UDP 是"介质拥有分帧权"最直接的证据：**它没有为此写一行业务代码**。数据报本身就是边界，
+所以 `send` 就是 `send_to`，`recv` 就是一次 `recv_from`——没有前缀、没有重组、没有半包状态。
+路由层拿到的仍然是一段完整信封，它不知道也不需要知道底下是流还是数据报。
+
+UDP 唯一多出来的复杂度在**接收侧**：一个绑定端口要服务多个邻居，所以有个 demux 线程把每个
+来源的数据报投进各自的队列，`accept` 每见到一个新来源就发出一条 `UdpLink`。第一个数据报会
+被缓存进队列——它很可能就是 `Hello`，丢掉它要多等一整个重试周期。
+
+### 广播发现：一次查询，两种端点
+
+```
+bob                                              alice (--announce)
+ │  UDP 255.255.255.255:47700  "谁在？"            │
+ ├───────────────────────────────────────────────▶│
+ │◀───────────────────────────────────────────────┤ "tcp://10.0.0.7:7100
+ │  unicast 回 bob 的临时端口                       │  udp://10.0.0.7:7101"
+```
+
+TCP 自己不能广播——连接必须先有地址。但"我的 TCP 端口是 7100"这句话完全可以用一个 UDP
+广播数据报喊出去。所以发现通道永远是 UDP，**载荷**里写的是哪种 scheme。一次查询，应答带回
+节点的所有端点。
+
+几个刻意的决定：
+
+- **查询方绑临时端口，应答方回到来源地址**。只有应答方需要占 47700，所以一台机器上可以跑
+  任意多个扫描者；两个节点跑在同一台机器上时用 `--discovery-port` 分开。
+- **查询也发一份到 127.0.0.1**。真实广播包在各平台的回环行为不一致，单机 demo 静默失败是
+  最差的第一次体验。
+- **应答和查询一样大**，不能被当成放大器。
+- **`0.0.0.0` 会被换成真实地址**。`--listen tcp://0.0.0.0:7100` 广播出去的是
+  `tcp://192.168.1.5:7100`，否则对端拿到一个没法拨的地址。
+
+### 不能广播的介质怎么办
+
+```rust
+pub trait Beacon: Send + Sync {
+    fn scheme(&self) -> &'static str;
+    fn can_broadcast(&self) -> bool { true }
+    fn broadcast(&self, a: &Announcement) -> Result<usize, LinkError>;
+    fn discover(&self, timeout: Duration) -> Result<Vec<Announcement>, LinkError>;
+}
+```
+
+`LinkFactory::beacon()` 的默认实现返回 `NoBroadcast`：`can_broadcast()` 为 false，
+`broadcast` 返回 `Ok(0)`，`discover` 返回空表。这不是错误路径，是正常答案——"这个介质问不到
+人"。所以 `--discover` 对所有注册的介质各问一次，不能广播的直接贡献零条结果，不需要任何
+`if scheme == "..."` 的特判。
 
 ## 路由协议
 
@@ -253,8 +425,7 @@ tag 比较走 RustCrypto 的 `verify_truncated_left`（内部 `subtle::ct_eq`，
 
 ## 模拟器（Rust）
 
-先把话说清楚：之前那套 Python 模拟器**没有调用 Rust 代码**——它是一份独立的第二实现，
-靠跨语言向量和 Rust 对齐。真正驱动生产代码的模拟器是 `retexis-sim`：
+模拟器驱动的是**生产代码本身**，不是一份为了演示另写的实现：
 
 ```bash
 cargo run -p retexis-sim                              # line x4 → http://127.0.0.1:8770
@@ -300,7 +471,8 @@ Rust 版跑真实时间，三个旋钮的语义和离散事件版不同，说清
 
 ## 可视化编辑器
 
-同一个 UI，两个后端。Rust 版提供同一套 JSON API，所以 `sim/web/index.html` 一个字没改。
+UI 是 `crates/retexis-sim/web/index.html` 里的一个单文件，无构建、无 CDN、无前端依赖。
+它只做两件事：发 JSON 请求、画服务端返回的快照。
 
 ![retexis 模拟器](docs/ui.png)
 
@@ -334,74 +506,57 @@ UI 能做的每件事都是一次 API 调用：
 
 ---
 
-## Python 参考模型
+## 线格式快照
 
-`sim/` 留下来不是历史包袱，它回答的是另一个问题：**换一种实现还能不能互通**。
+`crates/retexis-core/tests/wire_vectors.txt` 是**冻结的**字节快照：10 个信封 + 3 个 HMAC
+用例，每个都是 `FIELD`（字段）+ `HEX`（字节）。`wire_format.rs` 从字段重建信封、编码、逐字节
+比对，再解码回读。
 
-| | `retexis-sim`（Rust） | `sim/`（Python） |
-|---|---|---|
-| 协议代码 | 生产代码本身 | 独立重写的一份 |
-| 时间 | 真实时间，真线程 | 离散事件，可任意快进 |
-| 强项 | 交互式调试、看真实路由表 | 批量场景断言、跨语言向量 |
-| 协议改了 | 自动跟上 | 要手工同步 |
+它原本由一份独立的 Python 实现生成，用来验证"换一种语言实现还能不能互通"。那份实现已经删除
+（理由见下），快照留着，因为它的价值从来不是"跨语言"，而是**钉住字节布局**：字段挪一个字节、
+`VERSION` 翻一位、tag 长度改一下，这个测试立刻红——而不是等部署之后才发现和旧节点通不了。
 
-真正有意思的统计问题——5×5 网格多久收敛、一次风暴要多少帧、丢 30% 包会怎样——离散事件
-模型比真 socket 快几个数量级，所以场景跑在这里：
+没有生成器了。要改格式就手改 `HEX` 行，并且看一眼 diff：那个 diff 就是兼容性成本。
 
-```bash
-python sim/run.py --list        # 看有哪些场景
-python sim/run.py all           # 跑全部，失败则退出码非 0
-python sim/run.py storm --json  # 单个场景，机器可读
-python sim/run.py loss --verbose # 打印完整事件日志
-```
+### 为什么删掉第二份实现
 
-九个场景：
-
-| 场景 | 断言什么 |
-|---|---|
-| `line` | 4 节点链式，广播/单播穿过 3 跳，hop 计数正确 |
-| `triangle` | 环网一次广播每节点**恰好**收到一次（去重生效，无风暴） |
-| `ttl` | ttl=1 只到邻居，两跳外收不到 |
-| `loss` | 40% 丢包下可靠单播 8/8 送达、无重复投递、best effort 会丢 |
-| `auth` | 错误密钥的节点拿不到任何路由、收不到任何流量 |
-| `reconnect` | 杀掉节点 → 路由过期 → 退避重拨 → 复活后重新收敛 |
-| `partition` | 切断中段 → 双方遗忘 → 愈合 → 重新收敛 |
-| `relay` | 中继的下一条跳短暂断链后，重传仍能穿过 |
-| `storm` | 默认预算在正常负载下不触发；过载时转发量降 58%，送达率 62.8% |
-
-它仍然和 Rust **字节级互通**：`sim/golden.py` 生成向量文件，`cargo test` 里的
-`python_compat` 用它重建每个信封、编码、逐字节比对，再解码回读。两边一旦漂移立刻红。
-
-```bash
-python sim/golden.py --write   # 重新生成 crates/retexis-core/tests/golden_vectors.txt
-```
-
-### 这份参考模型抓到的真实 bug
-
-写第二份实现的回报很直接——下面两个都是它先发现，不是读代码想出来的：
+它曾经很有用。它先发现了两个真 bug，都不是读代码想出来的：
 
 1. **单次 Hello 丢失 → 链路永久半识别**。`a` 不知道 `b` 是谁，于是既不发路由也不泛洪，
-   链路静默失效。修复：Hello 变成请求-应答，且未识别的链路每个通告周期重发一次。
+   链路静默失效。TCP 上内核会重传所以永远看不见，换成 radio 就是致命问题。
+   修复（还在）：Hello 变请求-应答，未识别的链路每个通告周期重发，200ms 防放大窗口。
 2. **中继把重传当重复包吃掉**。carol 经 bob 发给 alice 的 DM，恰逢 bob 到 alice 的链路
-   抖动，bob 缓存了 msg id 然后丢弃所有重传，消息永远到不了。修复：去重只抑制广播，
-   单播重复包在中继处继续转发。
+   抖动，bob 缓存了 msg id 然后丢弃所有重传，消息永远到不了。
+   修复（还在）：去重只抑制广播，单播重复包在中继处继续转发。
 
-两个都补了回归测试，并且验证过"移除修复 → 测试变红"。
+但它的定位一直是"另一份实现"，这就决定了它**不能**回答"生产代码跑起来对不对"。而这件事现在
+由 `retexis-sim` 回答——每个节点就是一个真 `Router` 线程。于是它的成本开始大于收益：
+
+- 每次改协议都要手工同步两份，否则漂移；
+- 它的 9 个场景断言的是**模型**的行为，模型对了不代表实现对了；
+- 真正需要统计性的批量实验（丢包率、风暴规模）时，Rust 侧已经能用 `--seed` 复现，
+  缺的只是速度，而速度可以用并行测试补，不必再养一套协议实现。
+
+删掉之后，重复的东西只剩一处：`wire_vectors.txt` 里的字节。它没有生成器，也不需要。
 
 ## 测试
 
 ```bash
-cargo test --workspace                   # 95 个测试
-python sim/run.py all                    # 9 个场景
-python -m unittest sim/test_server.py     # 14 个 API 测试
+cargo test --workspace                   # 161 个测试
 cargo clippy --workspace --all-targets
 ```
 
 Rust 侧覆盖的真实场景：
 
 - `crates/retexis-crypto`：FIPS/RFC 4231 向量、截断 tag 校验、密钥不泄漏
-- `crates/retexis-core`：编解码往返、截断拒绝、名字 UTF-8 截断、与 Python 的字节级互通
-- `crates/retexis-link-tcp`：粘包/半包、超大帧、`shutdown` 唤醒阻塞的 `recv`
+- `crates/retexis-core`：编解码往返、截断拒绝、名字 UTF-8 截断、**冻结的线格式快照**
+- `crates/retexis-link-tcp`：粘包/半包、超大帧、`shutdown` 唤醒阻塞的 `recv`、能提供发现
+- `crates/retexis-link-udp`：一包一帧不截断、**一个 socket 服务两个邻居**（demux）、
+  `shutdown` 唤醒阻塞的 `recv`、超大报文在发送前被拒、对端不在时发送不报错（UDP 的诚实行为）
+- `crates/retexis-discovery`：应答方能回答查询、没人应答时返回空表而不是错误、查询不会被
+  当成应答（否则两个节点会互相弹）；Windows 上 ICMP port-unreachable 不当致命错误
+- **解耦约束**（`tests/decoupling.rs`，读 Cargo.toml）：路由/应用层不许依赖任何介质，
+  契约层零依赖，介质层不许反向依赖路由，没有 crate 引入 C 工具链
 - `crates/retexis-routing`：
   - 链式两跳（广播 + 单播，hop 计数）、三角环网去重、TTL=1、断链失效
   - **认证**：同密钥收敛、错密钥零路由、明文节点被拒
@@ -410,6 +565,15 @@ Rust 侧覆盖的真实场景：
   - **中继重传**：切掉最后一跳再愈合，重传仍能穿过
   - **重连**：`/kick` 式断链后监督线程重拨；四链路并发拨号收敛到一条且不振荡
   - **限流**：中继被限流、自己发的消息照常送达
+  - **换介质**：同一套路由代码跑在 UDP 上——两节点收敛、一个 socket 两个邻居、广播跨两跳、
+    可靠单播被 ack，`retexis-routing` 一行没改
+- `crates/retexis-data`：
+  - 帧：构造、content_type 判别、非 UTF-8 不硬转文本
+  - 流：顺序重组、乱序缓冲、重复丢弃、丢 Open 仍能收完、Close 有缺口报 `MissingChunks`、
+    窗口外的 chunk 被拒、两个发送方复用同一 id 互不干扰
+  - **端到端**：64 KiB / 64 chunk 跨两个真实路由器（TCP）逐字节一致；同一 channel 上帧与流
+    互不串味
+- `crates/retexis-app`：CLI 视图（CJK 宽度对齐、空网络给出下一步建议、默认不着色）
 - `crates/retexis-sim`：
   - 真 Router 过虚拟交换机：链式/环网收敛、广播恰好一次、两跳单播被 ack
   - 切断删路由、愈合恢复、150ms 延迟真的 ≥120ms、50% 丢包触发重传且不重复投递
@@ -429,10 +593,20 @@ Rust 侧覆盖的真实场景：
 - **模拟器不覆盖拨号器和 TCP 分帧**。网线是交换机插的，没有拨号过程，`HubLink` 也不存在
   粘包。这两条由 `retexis-routing` / `retexis-link-tcp` 的集成测试负责。
 - **模拟器的 `rate` 只缩放介质延迟**。路由通告的定时器在 Router 里，改不了也不该改。
+- **流没有流控**。快发送方能把慢接收方冲垮，接收方丢弃并报 `Dropped`；真正的背压需要信用窗口。
+- **流的可靠性是逐 chunk 的**。`open_reliable` 每个 chunk 一个 ack，传大文件时 ack 流量可观。
+- **UDP 没有可靠性和分片**。丢包由重传层兜底；超过 64 KiB 的信封在发送前就被拒，不切片。
+- **发现只在同一广播域内有效**。跨子网、跨公网找不到，得给地址。也没有鉴权：任何人都能
+  应答一条假公告，`--discover-connect` 因此只适合可信局域网。
+- **一个主机只能有一个应答者占着发现端口**（除非 `--discovery-port` 分开）。这是刻意
+  不引入 `SO_REUSEADDR` 的代价——那需要 `libc`，也就是 C 依赖。
+- **Windows 的 UDP 会把 ICMP 错误报在下一次 `recv` 上**。收到 port-unreachable 后
+  `recv_from` 返回 `WSAECONNRESET`，发现和 UDP 链路都把它当"暂时没数据"处理。
 
 ## 路线图
 
-- 介质：`http://`（长轮询）、`ws://`、`radio://`（LoRa/串口，窄带分片）
+- 介质：`ws://`、`http://`（长轮询）、`radio://`（LoRa/串口，窄带分片）
+- 发现：多播（239.x）代替广播、跨子网的中继应答、公告签名（现在谁都能应答）
 - 传输：二进制通道、流式通道（`StreamOpen/Chunk/Close` 已在线格式里）、大消息分片
 - 路由：按需路由（AODV）、多路径、链路质量度量、MPR 泛洪
 - 安全：每节点密钥对 + 信封签名、端到端加密、密钥轮换

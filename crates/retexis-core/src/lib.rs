@@ -14,10 +14,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod discovery;
 pub mod envelope;
 pub mod id;
 pub mod link;
 
+pub use discovery::{
+    Announcement, Beacon, Endpoint, NoBroadcast, ProbeKind, DEFAULT_PORT, MAX_PROBE, PROBE_MAGIC,
+};
 pub use envelope::{
     AckBody, Body, CodecError, ContentType, DataBody, Destination, Envelope, HelloBody, RouteBody,
     FLAG_ACK_REQ, FLAG_AUTH, HEADER_LEN, MAGIC, MAX_NAME, MAX_PAYLOAD, VERSION,

@@ -1,0 +1,15 @@
+[package]
+name = "retexis-data"
+description = "Data layer: frames and streams over the mesh, and how to deliver them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+retexis-core.workspace = true
+retexis-routing.workspace = true
+
+[dev-dependencies]
+retexis-link-tcp.workspace = true

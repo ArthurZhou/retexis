@@ -15,10 +15,17 @@
 //!
 //! Swap this crate out for `retexis-link-ws` / `-http` / `-radio` and the
 //! router never notices.
+//!
+//! **Discovery**: TCP itself cannot broadcast — a connection needs a peer
+//! address first. But a node can still announce *"my TCP port is 7100"* over a
+//! UDP broadcast datagram, which is what [`TcpFactory::beacon`] does. The
+//! discovery channel is UDP; the payload says `tcp://`.
 
 #![forbid(unsafe_code)]
 
-use retexis_core::{next_link_id, Link, LinkAcceptor, LinkError, LinkFactory, LinkId};
+use retexis_core::{
+    next_link_id, Beacon, Link, LinkAcceptor, LinkError, LinkFactory, LinkId, DEFAULT_PORT,
+};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -254,20 +261,50 @@ impl LinkAcceptor for TcpAcceptor {
 }
 
 /// Factory entry point for the transport registry.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct TcpFactory {
     pub cfg: TcpConfig,
+    /// UDP port used for IP broadcast discovery.
+    pub discovery_port: u16,
+}
+
+impl Default for TcpFactory {
+    fn default() -> Self {
+        TcpFactory {
+            cfg: TcpConfig::default(),
+            discovery_port: DEFAULT_PORT,
+        }
+    }
 }
 
 impl TcpFactory {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Overrides the discovery port, so two nodes on one host can be tested
+    /// without fighting over 47700.
+    pub fn with_discovery_port(mut self, port: u16) -> Self {
+        self.discovery_port = port;
+        self
+    }
 }
 
 impl LinkFactory for TcpFactory {
     fn scheme(&self) -> &'static str {
         "tcp"
+    }
+
+    /// Discovery for a connection-oriented medium: the announcement travels
+    /// over UDP broadcast and carries a `tcp://` endpoint to dial.
+    ///
+    /// Without this, `--listen tcp://...` would be undiscoverable and every
+    /// peer address would have to be typed by hand.
+    fn beacon(&self) -> Box<dyn Beacon> {
+        Box::new(retexis_discovery::BroadcastBeacon::new(
+            "tcp",
+            self.discovery_port,
+        ))
     }
 
     fn listen(&self, addr: &str) -> Result<Box<dyn LinkAcceptor>, LinkError> {
@@ -289,6 +326,18 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn tcp_can_still_be_discovered() {
+        // TCP cannot broadcast, but a node can announce a TCP endpoint over a
+        // UDP broadcast. The beacon belongs to the TCP factory because that is
+        // the medium whose endpoint is being advertised.
+        let factory = TcpFactory::new();
+        let beacon = factory.beacon();
+        assert_eq!(beacon.scheme(), "tcp");
+        assert!(beacon.can_broadcast());
+        assert_eq!(beacon.scheme(), factory.scheme());
+    }
 
     #[test]
     fn frames_survive_a_roundtrip() {

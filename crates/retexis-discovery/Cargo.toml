@@ -1,0 +1,11 @@
+[package]
+name = "retexis-discovery"
+description = "IP broadcast peer discovery shared by every transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+retexis-core.workspace = true

@@ -4,9 +4,10 @@
 //! every 120 ms with a handful of parallel requests, which this handles
 //! comfortably, and it keeps the whole crate dependency-free.
 //!
-//! The API is intentionally the same shape the Python simulator exposes, so
-//! the browser code is shared between the two engines — that is what makes
-//! "same UI, different engine" a checkable claim rather than a slogan.
+//! The JSON shape here is the only contract the UI has: `web/index.html`
+//! renders whatever `GET /api/state` returns and turns clicks into the requests
+//! below. Nothing about the protocol is decided in this file, which is why the
+//! UI can be tested through the API alone (`tests/api.rs`).
 
 use crate::hub::{LinkKey, LinkParams};
 use crate::json::{self, Json};

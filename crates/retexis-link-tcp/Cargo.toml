@@ -8,3 +8,4 @@ description = "Plain TCP medium for retexis"
 
 [dependencies]
 retexis-core.workspace = true
+retexis-discovery.workspace = true

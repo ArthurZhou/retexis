@@ -4,7 +4,7 @@
 
 ---
 
-## 一、七条不可破坏的约束
+## 一、八条不可破坏的约束
 
 任何改动如果违反了下面任何一条，这个项目就不再是它该有的样子了。
 
@@ -14,10 +14,13 @@
 **永远不读 payload 的字节**。一旦路由层开始理解业务内容（比如"这是聊天消息，需要重传"），
 它就无法再承载二进制、流式或未来任何一种传输。
 
-### 2. 传输层不碰路由头
+### 2. 数据层不碰路由头，应用层不碰协议
 
-`retexis-app` 只看到 `Delivery`（谁发的、哪个 channel、什么内容、走了几跳）。
+`retexis-data` 只看到 `Delivery`（谁发的、哪个 channel、什么内容、走了几跳）。
 它不知道 `LinkId`、不知道下一跳是谁、不知道 TTL。它只会说"把这个发给某人或所有人"。
+
+`retexis-app` 只看到 `Frame` 和 `StreamEvent`。它不构造信封、不选 content_type、不知道
+channel 号从哪来。**加一个应用（pty、文件、指标）就是写一个 `DataSink`**，不碰协议。
 
 ### 3. 介质拥有分帧权
 
@@ -28,23 +31,29 @@ ws 的事。**如果哪天介质需要路由层帮它分帧，说明抽象漏了
 推论：`Link::max_frame()` 是介质声明的硬上限，路由层据此拒绝装不下的信封并上报
 `DropReason::TooLarge`。不会静默截断。
 
-### 4. 只有 router 线程写路由状态
+### 4. 介质能力必须有默认实现
+
+`LinkFactory::beacon()` 默认返回 `NoBroadcast`。任何新增的能力都要遵循同样的形状：
+**默认值是"我做不到"，而不是"必须实现"**。否则每加一种介质就要改一遍所有已有介质，
+那说明这个能力放错了层。
+
+### 5. 只有 router 线程写路由状态
 
 `neighbors` / `table` / `names` / `dedup` / `pending` / `stats` 只有 router 线程能改。
 其它线程通过 `mpsc<Event>` 发消息、通过 `RwLock<MeshStatus>` 读快照。这条保证了下一条。
 
-### 5. 任何转发都必须先过去重
+### 6. 任何转发都必须先过去重
 
 `on_routable` 的第一件事是 `dedup.mark(env.id)`。去掉它，环网立刻变成广播风暴；
 路由表暂时不一致时单播会死循环。TTL 是最后一道防线，不是第一道。
 
-### 6. 认证必须在解码之前
+### 7. 认证必须在解码之前
 
 `on_inbound` 里验签发生在 `Envelope::decode` 之前，而且策略是全象限显式的：没有密钥就
 不接受带签名的包，有密钥就不接受明文包。**任何"验不过就降级为明文"的写法都是漏洞**，
 因为攻击者只需要发一个不带 tag 的包。
 
-### 7. 去重不能吃掉重传
+### 8. 去重不能吃掉重传
 
 去重缓存记录的是"这个 message id 我处理过"。但一个**中继**再次看到同一个单播，
 含义完全不同：发送方没收到 ACK，而我上次的转发可能根本没送达（下一跳当时是断的）。
@@ -160,7 +169,7 @@ tokio 会让"这个 `await` 点在哪"变成阅读理解题，而且在这个规
 
 1. **`Sealer` 接口不变**。换库只动了 `retexis-crypto` 一个文件，`retexis-routing` 一行没改。
 2. **RFC 向量测试全部保留**。它们现在反过来验证"换库没有改变行为"——同样的输入必须出同样的字节。
-3. **跨语言向量测试还在跑**。Python 的 `hashlib`/`hmac` 生成的 golden 文件，Rust 侧必须逐字节匹配，
+3. **冻结的线格式快照还在跑**。`wire_vectors.txt` 里那 3 个 HMAC 用例必须逐字节匹配，
    所以线格式的 tag 一个 bit 都没变。
 
 `verify` 用的是 `verify_truncated_left` 而不是 `verify_slice`：后者要求 tag 长度等于完整输出
@@ -206,43 +215,141 @@ tokio 会让"这个 `await` 点在哪"变成阅读理解题，而且在这个规
 
 ---
 
-## 四、两份实现，两种用途
+## 四、解耦：审计结果与可执行的约束
 
-`sim/` 是同一套协议的 Python 版本。**它不调用 Rust 代码**，这一点要说清楚，因为它决定了
-它适合回答什么问题。
+"三层解耦"这种话必须有证据。审计的办法是看依赖方向，而不是看注释里怎么写的。
 
-它值得存在，理由是：
+### 结论
 
-1. **统计性问题需要大量重复**。5×5 网格收敛要多久、丢包率 30% 时重传成功率多少、
-   什么速率下泛洪开始压垮节点——这些用真 socket 测一次要几十秒且结果不稳定，
-   在离散事件模型里是几百毫秒且可复现（固定 seed）。
-2. **故障注入要可控**。想测"第 3 个包丢了会怎样"，真 TCP 做不到。
-3. **它是一份独立的实现**。同一份规范被独立实现两遍，两边都跑通，说明规范本身是清楚的；
-   只有一份实现时，代码里的隐含假设不会被发现。
+| 检查 | 结果 |
+|---|---|
+| `retexis-core` 的 `[dependencies]` | 空。它只是词汇表（信封、ID、trait） |
+| `retexis-routing` 依赖 | 只有 core + crypto，**没有任何介质** |
+| `retexis-app` 依赖 | core + routing，不知道字节怎么走 |
+| 介质 crate 依赖 | 只有 core（+ discovery），不反向依赖路由 |
+| 线格式里的介质假设 | 无。固定 64B 头 + `max_frame` 由 trait 协商 |
+| 路由层里的介质分支 | 无 `if tcp` / `if udp`，只有 `Link` 的方法调用 |
 
-它有效的证据：**Hello 半识别、中继吃重传这两个真 bug 都是它先发现的**，不是读代码想出来的。
+### 审计抓到的两处真实泄漏（已修）
 
-风险是两份实现会漂移。防漂移靠 `sim/golden.py` + `crates/retexis-core/tests/python_compat.rs`：
-Python 生成向量文件，Rust 测试从中重建每个信封、编码、逐字节比对、再解码回读。一旦漂移，
-`cargo test` 立刻红。**规则：改协议要同时改两边，并重新生成向量。**
+1. **拨号路径绕过了注册表**。`main.rs` 里写着 `Dialer::new(Box::new(TcpFactory::new()), url)`
+   —— 也就是说 `--connect udp://...` 会拿 TCP 去连。注册表是存在的，但只用在 listen 一侧。
+   修法：注册表持有 `Arc<dyn LinkFactory>`，新增 `factory_for(url)`，拨号和监听走同一条
+   解析路径。这个 bug 在加 UDP 之前一直躺着，因为只有一种介质时它不可见。
+2. **介质名称进了通知枚举**。`RouterNotice::LinkUp { transport: &'static str }` 让路由层
+   知道"介质有名字"。这一条**保留**：它只是日志里的一个标签，去掉它就得让 UI 去猜。
+   写在这里是为了说明"完全解耦"是有代价的，我们选择留一个字符串。
 
-也正因为它是另一份实现，它**不能**回答"生产代码跑起来对不对"。那个问题从第五节的
-`retexis-sim` 开始由生产代码自己回答。
+还有一处**刻意不修**：`Link::initiator()` 是拨号器的概念（谁主动发起连接），放在介质
+trait 上并不纯粹。但重复链路仲裁要用它，而且所有介质都能如实回答，所以留着。
 
-### 做 Python 版 UI 时抓到的三个问题
+### 把结论变成测试
 
-1. **死节点还留着路由表**。`go_down()` 清了链路和 pending，忘了清 `table`，于是界面上
-   一个"已停止"的节点还显示着 5 条路由——它已经不可能用上了。进程死了内存就该没了。
-2. **改名不传播**。名字在握手（`hello`）时学到，之后的路由通告里虽然带着名字，但接收方
-   跳过了"发送者自己那条"，于是改名永远传不出去。修法：通告是权威来源，发送者的自身条目
-   也要更新名字（Rust 侧同步改了，虽然那边没有改名入口，但语义要一致）。
-3. **节点自己的广播显示成十六进制 id**。`names` 表里没登记自己，所以收件箱里认不出自己。
+架构会漂移，除非有人拦着。`crates/retexis-routing/tests/decoupling.rs` 直接读各个
+`Cargo.toml`：
 
-三个都是"看起来能用、细看不对"的问题，正是可视化最擅长暴露的那类。
+```rust
+assert!(!production_dependencies("retexis-routing").contains("retexis-link"));
+assert!(production_dependencies("retexis-core").trim().is_empty());
+```
+
+依赖图就是架构。有人往路由层里加一句 `use retexis_link_udp::...`，这个测试立刻红，
+而编译器不会报错。
+
+### 加一种介质要改什么（加 UDP 时实测）
+
+| 位置 | 改动 |
+|---|---|
+| `retexis-link-udp` | 新 crate：`Link` + `LinkAcceptor` + `LinkFactory` |
+| `retexis-node/main.rs` | 一行 `registry.register(Arc::new(UdpFactory::new()))` |
+| `retexis-routing` | **0 行** |
+| `retexis-core` | **0 行**（`beacon()` 有默认实现） |
+| `retexis-app` | **0 行** |
+
+UDP 还顺手证明了另一件事：**分帧权在介质手里是对的**。数据报本身有边界，所以 UDP 介质
+不需要长度前缀、不需要重组、没有半包状态——而路由层完全没察觉区别。
+
+### 发现为什么是介质的能力
+
+"附近有谁"是介质属性：以太网能广播，点对点不能，模拟交换机根本不存在"附近"。所以
+`Beacon` 挂在 `LinkFactory` 上，而不是塞进路由层。
+
+关键是**默认实现**：
+
+```rust
+fn beacon(&self) -> Box<dyn Beacon> {
+    Box::new(NoBroadcast::new(self.scheme()))
+}
+```
+
+`NoBroadcast` 的 `broadcast` 返回 `Ok(0)`、`discover` 返回空表。这不是错误路径，是正常
+答案——"这个介质问不到人"。于是 `--discover` 可以对所有注册介质各问一次，不需要任何
+`if scheme == "..."` 的特判，新加的介质也不会因为"忘了实现广播"而编译不过。
+
+TCP 的 beacon 值得单说：TCP 不能广播，但**宣告一个 TCP 端点**可以用 UDP 广播。所以
+发现通道永远是 UDP，载荷里写 `tcp://` 还是 `udp://`。这也是为什么 `retexis-discovery`
+是个独立 crate 而不是塞进某个介质里——两个介质指向同一份实现。
 
 ---
 
-## 五、Rust 模拟器：一台虚拟交换机
+## 五、线格式快照：留字节，不留实现
+
+项目里曾经有一份 Python 的第二实现（`sim/`），带 9 个场景和一套离散事件网络模型。它已经删除。
+`crates/retexis-core/tests/wire_vectors.txt` 留下来了，因为它留下的东西本来就不是"实现"。
+
+### 留下的是什么
+
+10 个信封 + 3 个 HMAC 用例，每个是 `FIELD`（字段）+ `HEX`（字节）。测试从字段重建信封、
+编码、逐字节比对，再解码回读。**两个方向都被钉住。**
+
+它现在的角色是**格式漂移告警**，不是互操作证明：字段挪一个字节、`VERSION` 翻一位、
+tag 长度改一下，`cargo test` 立刻红。没有它，这种改动要到和旧节点联调时才发现。
+
+代价是它**没有生成器**了。改格式就得手改 `HEX` 行，并且认真看 diff——这不是缺陷，
+是把"兼容性成本"显式化：那个 diff 就是所有已部署节点要付的代价。
+
+### 为什么删掉那份实现
+
+它确实有产出。两个真 bug 是它先发现的，都不是读代码想出来的：
+
+1. **单次 `Hello` 丢失 → 链路永久半识别**。`a` 不知道 `b` 是谁，于是既不发路由也不泛洪，
+   链路静默死掉。TCP 上内核会重传，所以这个问题在 TCP 上永远看不见；换成 radio 是致命的。
+   修复仍在：`Hello` 变请求-应答，未识别的链路每个通告周期重发，200ms 防放大窗口。
+2. **中继把重传当重复包吃掉**。carol 经 bob 发给 alice 的 DM，恰逢 bob 到 alice 的链路抖动，
+   bob 缓存了 msg id 然后丢弃所有重传，消息永远到不了。
+   修复仍在：去重只抑制广播，单播重复包在中继处继续转发。
+
+但它的定位一直是"另一份实现"，这决定了它**不能**回答"生产代码跑起来对不对"。而这个问题
+现在由 `retexis-sim` 回答——每个节点就是一个真 `Router` 线程，走的是生产路径。于是成本
+开始大于收益：
+
+| 成本 | 具体是什么 |
+|---|---|
+| 同步 | 每次改协议要手工改两份，漏了就漂移 |
+| 断言错层 | 9 个场景断言的是**模型**的行为，模型对了不代表实现对了 |
+| 假阳性 | 模型里通过的场景，可能是模型自己写错了 |
+| 维护面 | 一份 2000 行的协议实现 + 一套 HTTP 服务 + 一套 UI 后端 |
+
+第三行是关键：第二份实现最大的风险不是它出错，而是**它和你一起错**——两边都实现成一样的
+误解，测试全绿，而规范其实是另一回事。它抓到的两个 bug 都属于"一边对一边错"，
+这类问题它擅长；"两边都错"它一点忙都帮不上。
+
+### 第二份实现留下的三个 UI bug
+
+那套 Python 版也带过一个浏览器 UI，逼着去点测试没覆盖的路径，于是：
+
+1. **死节点还留着路由表**。`go_down()` 清了链路和 pending，忘了清 `table`，界面上一个
+   "已停止"的节点还显示着 5 条路由——它已经不可能用上了。
+2. **改名不传播**。名字在握手时学到，之后的路由通告里虽然带着名字，但接收方跳过了
+   "发送者自己那条"，于是改名永远传不出去。修法（Rust 侧同样生效）：通告是权威来源，
+   发送者的自身条目也要更新名字。
+3. **节点自己的广播显示成十六进制 id**。名字表里没登记自己。
+
+第 1、2 条的修复在 Rust 里仍然有效；第 3 条是那个 UI 的局部问题，随实现一起消失。
+
+---
+
+## 六、Rust 模拟器：一台虚拟交换机
 
 `retexis-sim` 里没有第二份协议。每个节点就是一个 `retexis_routing::Router` 线程：
 
@@ -312,7 +419,7 @@ Router 分不出它和 TCP socket 的区别。`retexis-routing` 为模拟器改�
 
 ---
 
-## 六、故障模式
+## 七、故障模式
 
 | 现象 | 实际发生什么 |
 |---|---|
@@ -337,7 +444,7 @@ Router 分不出它和 TCP socket 的区别。`retexis-routing` 为模拟器改�
 
 ---
 
-## 七、加东西的检查清单
+## 八、加东西的检查清单
 
 ### 加一个介质（http / ws / radio）
 
@@ -349,33 +456,47 @@ Router 分不出它和 TCP socket 的区别。`retexis-routing` 为模拟器改�
    - `initiator()` 要如实回答（`/peers` 会显示，重复链路诊断也靠它）。
    - 窄带介质：`max_frame` 设成真实 MTU，`send` 里切片，`recv` 里重组。
 3. 实现 `LinkAcceptor`（`accept()` 返回 `Box<dyn Link>`）和 `LinkFactory`（`scheme()` 返回 URL 前缀）。
-4. 在 `retexis-node/src/main.rs` 里 `registry.register(...)`，一行。
-5. 加测试：握手、粘包/半包、超大帧、对端关闭。
+4. **决定能不能发现**。能广播就覆盖 `beacon()` 返回 `BroadcastBeacon::new(scheme, port)`；
+   不能就什么都不写，默认的 `NoBroadcast` 会如实回答"问不到人"。
+5. 在 `retexis-node/src/main.rs` 里 `registry.register(Arc::new(XxxFactory::new()))`，一行。
+6. 加测试：握手、粘包/半包、超大帧、对端关闭；如果实现了 beacon，再加一个"能应答查询"的测试。
 
 **不需要改**：`retexis-core`、`retexis-routing`、`retexis-app`、`retexis-crypto`。
 
-### 加一个传输（二进制 / 流式 / 文件）
+### 加一个应用（pty / 文件 / 指标）
 
-1. 在 `retexis-app` 里实现 `Transport`：声明自己占用的 `channels()`，在 `on_delivery` 里处理。
-2. 发送侧写一个自由函数（参考 `chat::send_text` / `chat::send_reliable`），
-   调用 `handle.broadcast` / `handle.send_to` / `handle.send_reliable`。
-3. 在 `retexis-node` 里 `host.register(Box::new(YourTransport::new(...)))`。
-4. 流式传输需要自己维护会话状态（`StreamOpen` 开、`StreamChunk` 续、`StreamClose` 关），
-   并在 `on_tick` 里做超时清理 —— `content_type` 已经在线格式里预留好了。
+1. 在 `retexis-app` 里实现 `DataSink`：`name()`、`channels()`、`on_frame()`；
+   需要流就再实现 `on_stream()`。
+2. 发送侧用 `retexis_data::frame::send` / `send_reliable`，流用 `StreamSender`。
+3. 在 `cli::run` 里 `host.register(Box::new(YourSink::new(...)))`。
+4. 如果它有自己的 channel 名，加一个常量；不需要动线格式。
 
-**不需要改**：线格式（除非要加新的 `content_type`，那是加一个枚举值，`version` 不变）、
-路由层、介质层。
+**不需要改**：`retexis-data`（除非要加新的流语义）、线格式、路由层、介质层。
+
+### 改流的线格式
+
+流的三个 header（open/chunk/close）定义在 `retexis-data/src/stream.rs`，**不在信封里**。
+所以改它不用动线格式快照，也不会让旧节点解出垃圾——但会让新旧节点互相收不全，
+所以要么加版本字节，要么接受不兼容。
+
+### 改发现协议（`Announcement` 的字段）
+
+1. 改 `retexis-core/src/discovery.rs` 的 encode/decode，**同时改 `PROBE_MAGIC` 的版本位**
+   （`RXD1` → `RXD2`），否则新旧节点会互相解出垃圾。
+2. 加一个"旧版本被拒绝"的测试。
+3. 发现协议不在 `wire_vectors.txt` 里，所以不需要动快照。
 
 ### 改协议（任何字段）
 
-1. 改 `retexis-core/src/envelope.rs`（encode + decode + 文档表 + 测试）。
-2. 改 `sim/retexis/wire.py` 对应部分。
-3. `python sim/golden.py --write` 重新生成向量，跑 `cargo test -p retexis-core`。
-4. 如果改了状态机，两边都要改，并补一个模拟场景 + 一个 Rust 集成测试。
+1. 改 `retexis-core/src/envelope.rs`（encode + decode + 文件顶部那张字节表 + 单元测试）。
+2. **同步 `tests/wire_vectors.txt`**。没有生成器：手改 `HEX` 行，或者临时写个脚本从新编码器
+   导出再删掉脚本。改完跑 `cargo test -p retexis-core`。
+3. 如果 `VERSION` 变了，在 README 的已知限制里写清"旧节点会 `BadMagic`/拒绝"。
+4. 如果改了状态机，补一个 `retexis-routing` 集成测试 + 一个 `retexis-sim` 端到端测试。
 
 ---
 
-## 八、性能备注
+## 九、性能备注
 
 当前路径上的分配（每个转发包）：
 

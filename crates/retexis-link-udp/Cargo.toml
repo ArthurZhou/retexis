@@ -1,0 +1,12 @@
+[package]
+name = "retexis-link-udp"
+description = "UDP medium: one datagram per envelope, with IP broadcast discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+retexis-core.workspace = true
+retexis-discovery.workspace = true

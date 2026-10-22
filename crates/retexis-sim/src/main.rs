@@ -22,9 +22,9 @@ OPTIONS:
     --preset <KIND>     line | ring | grid | star [default: line]
     --nodes <N>         node count, 2..=16        [default: 4]
     --seed <N>          loss RNG seed             [default: 1234]
-    --web <DIR>         directory holding index.html
+    --web <DIR>         directory holding index.html  [default: crates/retexis-sim/web]
     --open              open a browser window
-    --no-open           accepted for parity with sim/server.py
+    --no-open           do not open a browser (default when stdout is not a TTY)
     -h, --help          print this help
 ";
 
@@ -103,7 +103,7 @@ fn main() -> ExitCode {
     let web_dir = match web.or_else(find_web_dir) {
         Some(dir) => dir,
         None => {
-            eprintln!("cannot find sim/web/index.html — pass --web <dir>");
+            eprintln!("cannot find index.html — pass --web <dir>");
             return ExitCode::FAILURE;
         }
     };
@@ -134,19 +134,20 @@ fn main() -> ExitCode {
     }
 }
 
-/// Looks for the shared UI next to the binary, then upwards from the cwd.
+/// Looks for the UI next to the binary, then upwards from the cwd.
 ///
-/// The HTML lives at `sim/web/index.html` in the repository because the Python
-/// server uses the same file. Finding it relative to the executable first means
-/// `cargo run` works from any directory.
+/// The HTML lives at `crates/retexis-sim/web/index.html`, i.e. inside this
+/// crate, so a packaged build can ship the directory next to the executable
+/// and `cargo run` can find it in the source tree. Searching relative to the
+/// executable first means either layout works from any working directory.
 fn find_web_dir() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.parent().map(|p| p.to_path_buf());
-        // target/debug/retexis-sim -> repo root is four levels up.
         for _ in 0..5 {
             if let Some(d) = &dir {
-                candidates.push(d.join("sim/web"));
+                candidates.push(d.join("web"));
+                candidates.push(d.join("crates/retexis-sim/web"));
                 dir = d.parent().map(|p| p.to_path_buf());
             }
         }
@@ -155,11 +156,15 @@ fn find_web_dir() -> Option<PathBuf> {
         let mut dir = Some(cwd);
         for _ in 0..4 {
             if let Some(d) = &dir {
-                candidates.push(d.join("sim/web"));
+                candidates.push(d.join("web"));
+                candidates.push(d.join("crates/retexis-sim/web"));
                 dir = d.parent().map(|p| p.to_path_buf());
             }
         }
     }
+    // Last resort for `cargo run` from an unrelated directory: the crate
+    // directory is known at compile time.
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web"));
     candidates
         .into_iter()
         .find(|p| p.join("index.html").is_file())
