@@ -377,6 +377,44 @@ fn the_send_button_on_an_empty_composer_sends_nothing() {
     assert_eq!(sent.get(), 0);
 }
 
+/// Clicking 发送 is not the end of the conversation.
+///
+/// A click on a `TouchArea` does not move focus in Slint, so the caret is still
+/// in the box after the button is pressed — the next message can be typed
+/// straight away. Worth pinning because the cheap way to make buttons
+/// keyboard-accessible is to focus them on click, and that would quietly break
+/// this: the second message would go to a button instead of the box.
+#[test]
+fn a_click_on_send_leaves_the_caret_in_the_box() {
+    let ui = window();
+    let sent = Rc::new(Cell::new(0));
+    {
+        let sent = Rc::clone(&sent);
+        let weak = ui.as_weak();
+        ui.on_send(move |_| {
+            sent.set(sent.get() + 1);
+            // What the bridge does when the node accepted the message.
+            if let Some(ui) = weak.upgrade() {
+                ui.set_draft("".into());
+            }
+        });
+    }
+
+    type_text(&ui, "hi");
+    let size = ui.window().size();
+    click(
+        &ui,
+        size.width as f32 - 14.0 - 36.0,
+        size.height as f32 - 14.0 - 16.0,
+    );
+    assert_eq!(sent.get(), 1);
+    assert_eq!(ui.get_draft(), "", "the box empties on send");
+
+    // The proof is the next keystroke.
+    type_text(&ui, "yo");
+    assert_eq!(ui.get_draft(), "yo", "the next message starts in the box");
+}
+
 #[test]
 fn double_clicking_connect_opens_then_closes_and_leaves_the_window_usable() {
     let ui = window();
