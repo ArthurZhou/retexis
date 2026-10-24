@@ -18,7 +18,7 @@ pub fn run(
     handle: &MeshHandle,
     me_name: &str,
     scanner: Option<&Scanner>,
-    connector: Option<&Connector<'_>>,
+    connector: Option<&Connector>,
 ) {
     let interactive = io::stdin().is_terminal();
     let stdin = io::stdin();
@@ -52,7 +52,7 @@ fn dispatch(
     handle: &MeshHandle,
     me_name: &str,
     scanner: Option<&Scanner>,
-    connector: Option<&Connector<'_>>,
+    connector: Option<&Connector>,
     input: &str,
 ) -> bool {
     if !input.starts_with('/') {
@@ -167,7 +167,7 @@ fn send_stream(handle: &MeshHandle, rest: &str) {
 ///
 /// The same path `--connect` uses, so the medium is resolved by scheme: a
 /// `udp://` URL cannot end up on a TCP socket.
-fn connect(connector: Option<&Connector<'_>>, handle: &MeshHandle, rest: &str) {
+fn connect(connector: Option<&Connector>, handle: &MeshHandle, rest: &str) {
     let Some(connector) = connector else {
         term::line("! this node was built without a connector");
         return;

@@ -26,6 +26,8 @@
 //! * The reply is the same size as the query, so this cannot be used as an
 //!   amplifier.
 
+pub mod scan;
+
 use retexis_core::{Announcement, Beacon, LinkError, ProbeKind, DEFAULT_PORT, MAX_PROBE};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -43,6 +45,36 @@ const SLICE: Duration = Duration::from_millis(50);
 /// It holds no socket: every `broadcast`/`discover` call uses a fresh
 /// ephemeral socket. That is what lets any number of these exist in one
 /// process (one per medium) without fighting over a port.
+/// The address to put in an announcement, given what a listener bound to.
+///
+/// A listener on `0.0.0.0:7100` is reachable but not *dialable*: a peer that
+/// receives `tcp://0.0.0.0:7100` has nowhere to connect to. This replaces the
+/// wildcard with the address the OS would use to reach the outside world, so
+/// discovery hands out something that works.
+pub fn advertised_addr(bound: &str) -> String {
+    let port = match bound.rsplit_once(':') {
+        Some((host, port)) if host == "0.0.0.0" || host == "[::]" || host == "::" => port,
+        _ => return bound.to_string(),
+    };
+    match local_ip() {
+        Some(ip) => format!("{ip}:{port}"),
+        // No route out (offline box, no default gateway). Loopback is the
+        // only address guaranteed to work, and saying so beats advertising
+        // 0.0.0.0.
+        None => format!("127.0.0.1:{port}"),
+    }
+}
+
+/// The local address the OS would use to reach the outside world.
+///
+/// Connecting a UDP socket sends no packets — it only asks the kernel to pick
+/// a source address — so this works offline and costs nothing.
+pub fn local_ip() -> Option<std::net::IpAddr> {
+    let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    probe.connect("8.8.8.8:80").ok()?;
+    Some(probe.local_addr().ok()?.ip())
+}
+
 pub struct BroadcastBeacon {
     scheme: &'static str,
     port: u16,
@@ -305,5 +337,23 @@ mod tests {
         assert!(n >= 1, "at least the loopback destination");
         assert_eq!(b.scheme(), "udp");
         assert!(b.can_broadcast());
+    }
+}
+
+#[cfg(test)]
+mod addr_tests {
+    use super::advertised_addr;
+
+    #[test]
+    fn wildcard_binds_are_replaced_with_something_dialable() {
+        let out = advertised_addr("0.0.0.0:7100");
+        assert!(out.ends_with(":7100"));
+        assert!(!out.starts_with("0.0.0.0"), "must not advertise a wildcard");
+    }
+
+    #[test]
+    fn concrete_binds_are_left_alone() {
+        assert_eq!(advertised_addr("127.0.0.1:7100"), "127.0.0.1:7100");
+        assert_eq!(advertised_addr("10.1.2.3:9"), "10.1.2.3:9");
     }
 }

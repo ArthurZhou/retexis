@@ -31,7 +31,6 @@ use retexis_routing::dial::ReconnectConfig;
 use retexis_routing::start;
 use retexis_routing::{FloodConfig, NoticeSink, RetryPolicy, RouterConfig, RouterNotice};
 use std::io::IsTerminal;
-use std::net::{IpAddr, UdpSocket};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +53,9 @@ pub fn run() {
     registry.register(Arc::new(
         UdpFactory::new().with_discovery_port(opts.discovery_port),
     ));
+    // Shared from here on: the dial path lives on its own threads, and the GUI
+    // reaches the same registry through the same type.
+    let registry = Arc::new(registry);
 
     // --- identity -----------------------------------------------------------
     let node_id = opts.id.unwrap_or_else(NodeId::random);
@@ -125,7 +127,7 @@ pub fn run() {
             Ok(acceptor) => {
                 let bound = acceptor.local_addr();
                 let transport = acceptor.transport();
-                let endpoint = Endpoint::new(transport, advertised(&bound));
+                let endpoint = Endpoint::new(transport, retexis_discovery::advertised_addr(&bound));
                 term::line(format!(
                     "  · listening {transport}://{bound}  (advertising {})",
                     endpoint.url()
@@ -180,7 +182,7 @@ pub fn run() {
 
     // --- media: dial --------------------------------------------------------
     let connector = Connector::new(
-        &registry,
+        Arc::clone(&registry),
         Arc::clone(&notices),
         ReconnectConfig {
             enabled: opts.reconnect,
@@ -271,30 +273,6 @@ fn print_found(found: &[Announcement]) {
 
 /// Replaces a wildcard bind address with the address a peer could actually
 /// reach. `0.0.0.0:7100` means "listen everywhere", not "connect here".
-fn advertised(bound: &str) -> String {
-    let port = match bound.rsplit_once(':') {
-        Some((host, port)) if host == "0.0.0.0" || host == "[::]" || host == "::" => port,
-        _ => return bound.to_string(),
-    };
-    match local_ip() {
-        Some(ip) => format!("{ip}:{port}"),
-        // No route out (offline box, no default gateway). Loopback is the
-        // only address guaranteed to work, and saying so beats advertising
-        // 0.0.0.0.
-        None => format!("127.0.0.1:{port}"),
-    }
-}
-
-/// The local address the OS would use to reach the outside world.
-///
-/// Connecting a UDP socket sends no packets — it only asks the kernel to pick
-/// a source address — so this works offline and costs nothing.
-fn local_ip() -> Option<IpAddr> {
-    let probe = UdpSocket::bind("0.0.0.0:0").ok()?;
-    probe.connect("8.8.8.8:80").ok()?;
-    Some(probe.local_addr().ok()?.ip())
-}
-
 /// `JoinHandle::join` has no timeout; a stuck router must not hang exit.
 trait JoinTimeout {
     fn join_timeout(self, d: Duration) -> std::io::Result<()>;
@@ -309,23 +287,5 @@ impl JoinTimeout for std::thread::JoinHandle<()> {
         });
         rx.recv_timeout(d)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "join timed out"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wildcard_binds_are_replaced_with_something_dialable() {
-        let out = advertised("0.0.0.0:7100");
-        assert!(out.ends_with(":7100"));
-        assert!(!out.starts_with("0.0.0.0"), "must not advertise a wildcard");
-    }
-
-    #[test]
-    fn concrete_binds_are_left_alone() {
-        assert_eq!(advertised("127.0.0.1:7100"), "127.0.0.1:7100");
-        assert_eq!(advertised("10.1.2.3:9"), "10.1.2.3:9");
     }
 }

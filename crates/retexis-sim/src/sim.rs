@@ -15,8 +15,8 @@
 //! interactive: the whole medium contract is the `Link` trait.
 
 use crate::hub::{Hub, LinkKey, LinkParams, LinkView};
-use crate::json::Json;
 use retexis_core::{ContentType, NodeId};
+use retexis_http::Json;
 use retexis_routing::{Delivery, MeshHandle, MeshStatus, RouterConfig, RouterNotice};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};

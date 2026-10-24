@@ -260,6 +260,13 @@ pub enum StreamEvent {
         channel: String,
         id: StreamId,
         name: String,
+        /// Whether the stream was flooded rather than addressed.
+        ///
+        /// The assembler only sees frames, but a sink has to know whether to
+        /// show "to everyone" or "direct" — and it cannot guess that from the
+        /// payload.
+        broadcast: bool,
+        hops: u8,
     },
     Data {
         from: NodeId,
@@ -272,6 +279,8 @@ pub enum StreamEvent {
         channel: String,
         id: StreamId,
         bytes: usize,
+        broadcast: bool,
+        hops: u8,
     },
     Dropped {
         from: NodeId,
@@ -325,6 +334,8 @@ impl fmt::Display for StreamDropReason {
 
 struct Pending {
     name: String,
+    broadcast: bool,
+    hops: u8,
     /// Next sequence number we still need.
     next: u32,
     /// Chunks that arrived early, waiting for the gap to fill.
@@ -389,6 +400,8 @@ impl StreamAssembler {
                     (from, id.0),
                     Pending {
                         name: name.clone(),
+                        broadcast: frame.broadcast,
+                        hops: frame.hops,
                         next: 0,
                         buffered: BTreeMap::new(),
                         bytes: 0,
@@ -399,13 +412,19 @@ impl StreamAssembler {
                     channel,
                     id,
                     name,
+                    broadcast: frame.broadcast,
+                    hops: frame.hops,
                 }]
             }
             ContentType::StreamChunk => {
                 let Some((id, seq, data)) = parse_chunk(payload) else {
                     return Vec::new();
                 };
-                // A lost Open must not kill the transfer: adopt the chunk.
+                // A lost Open must not kill the transfer: adopt the chunk and
+                // report an `Opened` for it. Sinks need that event to learn
+                // where the stream came from and whether it was flooded; the
+                // alternative is every sink keeping its own guess.
+                let mut adopted = false;
                 if !self.open.contains_key(&(from, id.0)) {
                     if self.open.len() >= self.max_open {
                         return vec![StreamEvent::Dropped {
@@ -420,14 +439,29 @@ impl StreamAssembler {
                         (from, id.0),
                         Pending {
                             name: String::new(),
+                            // No `Open` was seen, so this frame is all we
+                            // know about the stream's routing.
+                            broadcast: frame.broadcast,
+                            hops: frame.hops,
                             next: 0,
                             buffered: BTreeMap::new(),
                             bytes: 0,
                         },
                     );
+                    adopted = true;
                 }
 
                 let mut out = Vec::new();
+                if adopted {
+                    out.push(StreamEvent::Opened {
+                        from,
+                        channel: channel.clone(),
+                        id,
+                        name: String::new(),
+                        broadcast: frame.broadcast,
+                        hops: frame.hops,
+                    });
+                }
                 let pending = self.open.get_mut(&(from, id.0)).expect("just inserted");
                 if seq < pending.next {
                     return Vec::new(); // already delivered
@@ -476,6 +510,8 @@ impl StreamAssembler {
                     channel,
                     id,
                     bytes: pending.bytes,
+                    broadcast: pending.broadcast,
+                    hops: pending.hops,
                 }]
             }
             _ => Vec::new(),
@@ -636,9 +672,15 @@ mod tests {
         let mut asm = StreamAssembler::new();
         let from = peer();
         let id = StreamId(13);
-        // No open frame at all.
+        // No open frame at all: the first chunk adopts the stream, and the
+        // sink is told about it so it can attribute the data.
         let out = asm.accept(&chunk_frame(from, id, 0, b"data"));
-        assert!(matches!(&out[0], StreamEvent::Data { .. }));
+        assert_eq!(out.len(), 2);
+        assert!(matches!(
+            &out[0],
+            StreamEvent::Opened { name, .. } if name.is_empty()
+        ));
+        assert!(matches!(&out[1], StreamEvent::Data { .. }));
         let out = asm.accept(&close_frame(from, id, 1));
         assert!(matches!(&out[0], StreamEvent::Closed { bytes: 4, .. }));
     }
@@ -692,6 +734,47 @@ mod tests {
         // b's stream is untouched.
         let out = asm.accept(&chunk_frame(b, id, 0, b"B"));
         assert!(matches!(&out[0], StreamEvent::Data { chunk, .. } if chunk == b"B"));
+    }
+
+    #[test]
+    fn opened_and_closed_carry_the_routing_facts() {
+        let mut asm = StreamAssembler::new();
+        let from = peer();
+        let id = StreamId(31);
+        let mut open = open_frame(from, id, "wide");
+        open.broadcast = true;
+        open.hops = 2;
+
+        let out = asm.accept(&open);
+        assert!(matches!(
+            &out[0],
+            StreamEvent::Opened {
+                broadcast: true,
+                hops: 2,
+                ..
+            }
+        ));
+
+        let mut chunk = chunk_frame(from, id, 0, b"data");
+        chunk.broadcast = true;
+        chunk.hops = 2;
+        asm.accept(&chunk);
+
+        let mut close = close_frame(from, id, 1);
+        close.broadcast = true;
+        close.hops = 2;
+        let out = asm.accept(&close);
+        assert!(
+            matches!(
+                &out[0],
+                StreamEvent::Closed {
+                    broadcast: true,
+                    hops: 2,
+                    ..
+                }
+            ),
+            "a sink must be able to tell a broadcast stream from a DM"
+        );
     }
 
     #[test]

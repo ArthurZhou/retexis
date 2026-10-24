@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 retexis-core.workspace = true
+retexis-http.workspace = true
 retexis-data.workspace = true
 retexis-routing.workspace = true
 

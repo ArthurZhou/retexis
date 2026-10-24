@@ -86,11 +86,11 @@ impl Dialer {
             let connected = match self.factory.connect(&self.addr) {
                 Ok(link) => match handle.add_link(link) {
                     Ok(link_id) => {
-                        failures = 0;
                         notices(RouterNotice::Reconnected {
                             url: self.url.clone(),
                         });
                         // Watch it until it dies or the mesh stops.
+                        let born = Instant::now();
                         loop {
                             thread::sleep(self.cfg.probe);
                             if !handle.is_running() {
@@ -99,6 +99,14 @@ impl Dialer {
                             if !handle.is_link_up(link_id) {
                                 break;
                             }
+                        }
+                        // Only a link that *stayed* up resets the backoff. A
+                        // connection that closes immediately (the peer rejects
+                        // the handshake, we dialled ourselves, the other end
+                        // crashed on accept) is a flap: retrying it every
+                        // 300 ms forever is worse than backing off.
+                        if born.elapsed() >= STABLE_AFTER {
+                            failures = 0;
                         }
                         false
                     }
@@ -141,6 +149,10 @@ impl Dialer {
         capped.mul_f64(jitter)
     }
 }
+
+/// A link must live this long before its success counts as "connected" and
+/// resets the retry backoff.
+const STABLE_AFTER: Duration = Duration::from_secs(2);
 
 /// Deterministic-ish jitter in 0.75..=1.25 without pulling in an RNG crate.
 fn jitter_permille(seed: u64) -> f64 {

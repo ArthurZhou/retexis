@@ -29,6 +29,7 @@ alice <--tcp--> bob <--tcp--> carol      alice 和 carol 之间没有连接
 | **泛洪抑制** | 令牌桶（全局 + 按来源），默认预算在聊天负载下永不触发 |
 | **模拟器** | `retexis-sim`：每个节点就是一个真 Router 线程，一台虚拟交换机按网页配置插拔链路 |
 | **可视化编辑器** | 浏览器里拖节点、连链路、改延迟丢包、按节点收发消息，看真实路由表收敛 |
+| **桌面聊天** | `retexis-gui`：原生窗口（Slint，软件渲染），底下是真 Router + 真 TCP/UDP，不是演示 |
 
 ---
 
@@ -46,6 +47,13 @@ cargo build --release
 
 # 终端 3：只连 bob，和 alice 之间没有任何直连
 ./target/release/retexis --name carol --connect tcp://127.0.0.1:7101 --psk "our secret"
+```
+
+不想开终端也行——桌面应用是独立二进制，底层是同一个节点：
+
+```bash
+cargo run -p retexis-gui                       # 一个原生窗口，自动监听 7100 并广播自己
+cargo run -p retexis-gui -- --name bob        # 第二个窗口，点「发现」就能找到第一个
 ```
 
 不想手打地址时，广播发现一步到位：
@@ -135,6 +143,8 @@ reliable  acked 1   failed 0   retransmits 0
 ┌──────────────────────────────────────────────────────────────────────┐
 │ retexis-app       应用层    "人怎么用它"                             │
 │   CLI/REPL · 表格与网络树渲染 · chat 应用（一个 DataSink）            │
+│ retexis-gui       应用层    同一个 chat 协议，另一个界面             │
+│   原生窗口 (Slint/软件渲染) · 时间线 · 发现/连接面板 · 唯一带 GUI 的 crate │
 ├──────────────────────────────────────────────────────────────────────┤
 │ retexis-data      数据层    "这些字节是什么意思"                     │
 │   Frame(一帧一条消息) · Stream(open/chunk/close + 重组) · DataHost    │
@@ -153,6 +163,8 @@ reliable  acked 1   failed 0   retransmits 0
 │   一包一帧（不分帧）· 一个 socket 多对端（demux）                     │
 │ retexis-discovery 发现      "附近有谁"                                │
 │   UDP 广播查询/应答 · 给任何介质提供 Beacon                           │
+│ retexis-http      管道      模拟器用的 std HTTP/JSON                  │
+│   请求解析 · 百分号解码 · 响应写出（零依赖）                          │
 └──────────────────────────────────────────────────────────────────────┘
          retexis-crypto：Sealer 封装 HMAC-SHA256（RustCrypto 纯 Rust 实现）
 ```
@@ -163,12 +175,14 @@ reliable  acked 1   failed 0   retransmits 0
 - **介质层拥有分帧权**。路由层只交给它一段已编码的信封字节，怎么放上介质由它决定
   （流式介质加长度前缀，数据报介质一包一帧，窄带介质自己切块）。这就是解耦点。
 - **数据层不知道介质，应用层不知道协议**。`retexis-data` 里没有 socket、没有终端；
-  `retexis-app` 里没有线格式、没有 channel 号。加一个 `pty` 应用只需写一个 `DataSink`。
+  `retexis-app` / `retexis-gui` 里没有线格式、没有 channel 号。加一个 `pty` 应用只需写一个
+  `DataSink`，加一个界面只需再写一个 `DataSink`——两个应用是兄弟，谁也不依赖谁。
 - **认证是字节流上的过滤器**，在 `Envelope::decode` 之前跑，坏包根本进不了解码器。
 - **介质能力是可选的**。`LinkFactory::beacon()` 默认返回 `NoBroadcast`（`broadcast` 回 0、
   `discover` 回空表），所以点对点介质不用为"不能广播"写任何代码，调用方也不用特判。
-- 每层都能单独测试：161 个 Rust 测试，其中包含真实 TCP/UDP 的多跳、环网、断链、确定性丢包
-  链路、四链路并发重连、跨两个真路由器的 64 KiB 流式传输，以及**读 Cargo.toml 的解耦约束测试**。
+- 每层都能单独测试：213 个 Rust 测试，其中包含真实 TCP/UDP 的多跳、环网、断链、确定性丢包
+  链路、四链路并发重连、跨两个真路由器的 64 KiB 流式传输、**两个 GUI 窗口互相收发消息**，
+  以及**读 Cargo.toml 的解耦约束测试**。
 
 ## crate 地图
 
@@ -177,13 +191,15 @@ reliable  acked 1   failed 0   retransmits 0
 | `retexis-core` | 线格式、ID、`Link` 抽象、介质注册表 | 无 |
 | `retexis-crypto` | 信封密封（RustCrypto `sha2` + `hmac`） | 纯 Rust，无 C |
 | `retexis-discovery` | IP 广播发现（查询/应答），给所有介质共用 | core |
+| `retexis-http` | std-only HTTP/1.1 + JSON，模拟器的控制 API 用 | 无 |
 | `retexis-link-tcp` | TCP 介质（流，长度前缀分帧） | core, discovery |
 | `retexis-link-udp` | UDP 介质（数据报，一包一帧，多对端 demux） | core, discovery |
 | `retexis-routing` | 路由表、转发、去重、限流、重传、拨号器 | core, crypto |
 | `retexis-data` | 帧、流、channel 分发（协议部分） | core, routing |
-| `retexis-app` | 应用层：CLI、REPL、渲染、chat | core, data, routing, crypto, discovery, link-* |
+| `retexis-app` | 应用层：CLI、REPL、渲染、chat | core, data, routing, crypto, discovery, http, link-* |
 | `retexis-node` | 二进制 `retexis`，10 行入口 | app |
-| `retexis-sim` | 模拟器：虚拟交换机 + JSON API + 单页 UI | core, routing, app |
+| `retexis-gui` | 桌面聊天：真节点 + 原生窗口 | core, data, routing, crypto, discovery, link-*, slint |
+| `retexis-sim` | 模拟器：虚拟交换机 + JSON API + 单页 UI | core, http, data, routing |
 
 ## 线格式（v2）
 
@@ -423,6 +439,142 @@ tag 比较走 RustCrypto 的 `verify_truncated_left`（内部 `subtle::ct_eq`，
 
 ---
 
+## 桌面聊天（retexis-gui）
+
+```bash
+cargo run -p retexis-gui                       # 一个原生窗口，自动监听 7100 并广播自己
+cargo run -p retexis-gui -- --name bob        # 第二个窗口，点「发现」就能找到第一个
+cargo run -p retexis-gui -- --connect tcp://10.0.0.7:7100 --psk "our secret"
+```
+
+![retexis chat](docs/gui.png)
+
+上面这张图是 alice 的窗口（`scripts/gui_demo.py` 生成）：左边是能到达的节点（bob，direct，1 跳），
+右边是对话，顶部是身份、链路数和认证状态（`OPEN` 表示没设 PSK，设了会显示 `AUTH`）。
+自己发的消息是白底黑字、靠右；别人的是深色卡片、靠左。最后一条是 580 字节的流式消息——
+**在发送端被切成多个 chunk，到这边重组成一个气泡**（角标 `STREAM · DM`，右下角是字节数）。
+
+### 界面：只有结构
+
+一眼能看出来的东西只有三样：**字重**、**分隔线**、**明暗反转**。没有圆角、没有阴影、没有强调色，
+需要强调的地方就反色（自己发的消息、选中的节点、主按钮）。标签是小号大写，数字（跳数、字节数、
+时间、节点 id）一律等宽——看数字就知道自己在看数据而不是句子。
+
+三条动画，都是反馈而不是装饰：新消息淡入（180ms）、按钮在指针下换底色（80ms）、
+对话框连同遮罩从底部浮起（130ms）。
+
+两个对话框长这样（`python scripts/gui_demo.py --dialogs` 生成，用的是真的扫描）：
+
+| 发现 | 连接 |
+|---|---|
+| ![discover](docs/gui-discover.png) | ![connect](docs/gui-connect.png) |
+
+发现面板的高度跟着结果走：一个节点就是一个节点的高度，十二个节点封顶 300px 之后在面板内部滚动，
+永远比窗口矮。连接面板只有一个输入框和一个按钮，所以它就那么高。
+
+### 原生窗口，底下是真节点
+
+窗口是 `Slint`，而且是**软件渲染**：没有 GPU、没有 OpenGL、没有 C 工具链。
+节点是 `retexis_routing::start()` 起的真 Router，真 TCP/UDP，真握手、真路由表、真 ACK 重传、真 HMAC。
+
+```text
+原生窗口 (Slint)                   retexis-gui 进程
+┌──────────────┐               ┌──────────────────────────────┐
+│ chat.slint   │ ─── rows ────▶│ bridge.rs（模型、100ms 定时器）│
+│  时间线       │ ◀── 回调 ────│            │                 │
+│  节点列表     │               │            ▼                 │
+└──────────────┘               │      ChatSink  ← DataHost    │
+                               │            ▲                 │
+                               │      Router（真的）← 介质     │
+                               └──────────────────────────────┘
+```
+
+`ChatSink` 就是 `retexis-data` 的一个 `DataSink`，和终端客户端里那个是同类东西：消息进来
+变成时间线条目，流进来先重组再变成条目。**协议只有一份，界面有两份。**
+
+### 为什么是 Slint，而且是软件渲染
+
+`Slint` 是声明式的：`ui/chat.slint` 在 `build.rs` 里编译成 Rust，布局、换行、命中测试都由
+它算，手写的 Rust 只负责把节点状态变成行（`model.rs`）。选 `renderer-software` 是因为它把
+界面画进一块普通内存缓冲，再 `BitBlt` 到窗口——不需要 GPU，远程桌面里也能跑，而且
+`cargo tree` 里没有 `cc`、`bindgen`、`cmake`（`decoupling.rs` 里有断言盯着这条；
+`windows-sys` 只是 API 声明，不编译任何 C）。
+
+代价是依赖数量：这一个 crate 带进来 242 个 crate，构建从 20 秒变成两分钟。所以
+`retexis-gui` 单独把 `rust-version` 提到 **1.95**，其余 11 个 crate 仍然是 1.75——
+协议核心还能往小目标上编，窗口只在你桌面上跑。
+
+还有一件小事但必须做：`default-font-family` 只接受**一个**家族，不是 CSS 列表。`fonts.rs`
+按平台挑第一个装了的（Windows 上 `Microsoft YaHei`，macOS 上 PingFang，Linux 上 Noto CJK），
+缺字时 Slint 再按字形回退——所以借不到时是"字形不如预期"，而不是一屏豆腐块。
+
+### 能做什么
+
+- 输入框开窗即获得焦点；Enter 发送（单行输入框，要换行就发第二条）
+- `--say "..."` 可以在启动时广播一句，脚本和截图用得到
+- 左侧选「所有人」广播，选某个节点就是私聊；私聊气泡右下角显示 `SENDING` / `DELIVERED` / `FAILED`
+- 超过 1 KiB 自动走流式通道，接收端重组后仍是一条消息
+- 「发现」广播查询局域网，列出应答者和它们的端点，点一下就连接
+- 「连接」手输 `tcp://` / `udp://` 地址；连自己会被拒绝并说明原因
+- 对话框打开时键盘跟着走（输入落到地址框），Esc 或点遮罩关闭，关掉之后焦点回到输入框
+- 系统事件（链路起落、路由增删、认证失败、重连）作为灰色等宽小字插在时间线里——
+  "为什么这条没送到"通常由三秒前那行"链路断开"回答
+
+### 这个窗口是测出来的，不是看出来的
+
+`tests/ui.rs` 里 18 个测试跑在 Slint 的 headless 后端上：真布局、固定字体度量、真的
+`WindowEvent`。所以"Esc 关掉对话框"是**在已知坐标按一下 Esc** 得到的答案，不是读 `.slint`
+文件猜焦点链：
+
+- 开窗就能打字，不用先点输入框；Esc 在输入框有焦点时也能关掉对话框（按键处理挂在祖先上）
+- 点遮罩关闭，点面板内部不关闭——否则对话框点一下就没了
+- 「连接」打开时键盘跟着走，关掉之后回到输入框；「发现」没有输入框，所以什么都打不进去
+- 侧栏第 0 行是「所有人」，第 1 行才是第一个节点（这条错过一次：点第一个节点会发给所有人）
+- 12 个节点 × 2 个端点的结果列表仍然能被遮罩关掉（面板一旦高过窗口，遮罩就跑到了够不着的地方）
+- 空输入框按 Enter / 点「发送」什么都不发（否则界面会弹出一行"empty message"的错误）
+- 双击「连接」= 开一次、关一次，因为第二下已经落在遮罩上了；之后照样能打字
+- 点标题栏或空白处，光标回到输入框（否则窗口看着有焦点，却吞掉每一个按键）
+
+`tests/two_nodes.rs` 管另一半：两个真节点、一条真 TCP，一个窗口里打的字出现在另一个的时间线上。
+另外三条是"人真的会这么干"的演练：刚拨号、还没收敛就发消息（不能卡死，之后必须还能发）、
+`--say` + `--connect` 启动参数、以及拨自己的地址（必须给出人能看懂的理由）。
+
+### 做这个窗口时踩到的坑
+
+1. **隐藏的布局项照样占地方**。两个对话框的正文都常驻在树里（`visible:` 切换），因为
+   `changed dialog` 要把焦点送进地址框，元素就得一直存在。代价是 `visible: false` 只停像素、
+   不停布局：面板按「连接 + 发现」两块之和算高度，于是发现面板的标题和第一条结果之间
+   空出一大块（正好是另一个对话框的高度）。修法是把隐藏块的 `height` 压到 0，再给两块套一个
+   `spacing: 0` 的容器——否则那块 0 高度的东西还会留下 10px 间距。截图才看得见这种错，
+   所以 `--dialogs` 是单独一条命令。
+2. **`PrintWindow` 截不到这个窗口**。帧本来就在内存里，但 `PrintWindow` 走的是 DWM 合成
+   结果：远程会话里拿回来的是一张半成品（左边画好了，右边是白的），从屏幕 `BitBlt` 更糟，
+   直接全黑。所以 `RETEXIS_SHOT` 让**应用自己** `take_snapshot()` 把帧缓冲写成 BMP——
+   它本来就知道自己画了什么。`scripts/gui_demo.py` 用这个做截图，顺便当成一次端到端冒烟。
+3. **`LineEdit` 自带 4px 圆角和 Fluent 边框**，而这个窗口里每个角都是直角。所以输入框是
+   `TextInput` + `Rectangle` 自己搭的（光标宽度、选区配色、水平滚动都得自己接）。
+   `ScrollView` 只用它的滚动机制（滚轮、拖拽、惯性、边界），它自带的滚动条关掉，3px 方块自己画。
+4. **测试里的坐标是布局常量，不是语义**。`click(50, 71)` 点的是「发现」，因为头部 46px、
+   工具栏 50px。改布局就得一起改测试——这是刻意的：它保证控件真的被点过，而不是被"调用"过。
+
+再往前，浏览器版还抓到过两个**协议层**的 bug，修复都还在：
+
+5. **广播的流被当成私聊**。`StreamEvent` 不带"这条流是广播还是单播"，界面只能假定是私聊。
+   修法：`Opened`/`Closed` 带上 `broadcast` 和 `hops`；丢弃 `Open` 而隐式建流时也补发一个
+   `Opened`，否则接收端不知道这条流该归给谁。
+6. **连自己会变成 300ms 一次的重连风暴**。同一台机器上第二个窗口拨了第一个的端口（或者
+   自己刚抢到的默认端口）。Router 在握手里就拒绝了自连，但拨号器把"连上又立刻断开"当成
+   成功，退避永远重置。修法：链路必须活过 2 秒才算连上；界面在拨号前先比对自身监听地址。
+   `tests/flap.rs` 盯着这条，去掉修复它会立刻变红（实测 1.5 秒内 25 次重试）。
+
+### 没有做的
+
+- **没有历史记录**。时间线在内存里，上限 4000 条 / 8 MiB，关窗即消失。
+- **只能发文本**。二进制和文件已经能走流（`StreamSender` 就在那儿），但没有选文件的界面。
+- **没有托盘、没有系统通知**。关窗就是退出节点。
+
+---
+
 ## 模拟器（Rust）
 
 模拟器驱动的是**生产代码本身**，不是一份为了演示另写的实现：
@@ -542,7 +694,7 @@ UI 能做的每件事都是一次 API 调用：
 ## 测试
 
 ```bash
-cargo test --workspace                   # 161 个测试
+cargo test --workspace                   # 219 个测试
 cargo clippy --workspace --all-targets
 ```
 
@@ -574,6 +726,15 @@ Rust 侧覆盖的真实场景：
   - **端到端**：64 KiB / 64 chunk 跨两个真实路由器（TCP）逐字节一致；同一 channel 上帧与流
     互不串味
 - `crates/retexis-app`：CLI 视图（CJK 宽度对齐、空网络给出下一步建议、默认不着色）
+- `crates/retexis-http`：JSON 往返、空 body 当空对象、坏 JSON 报错不 panic、百分号解码
+- `crates/retexis-gui`：
+  - 日志：序号单调、游标只返回新增、ACK 能找到对应消息、按条数和字节双重淘汰
+  - 消息：自己的广播只出现一次（路由器回环不能重复显示）、广播流不是私聊、长消息走流
+  - 视图：`age()` 的相对时间、私聊气泡的送达文案
+  - **端到端**：两个节点真 TCP 互通——私聊到达并被 ACK、广播恰好一次、1088 字节流式消息
+    重组为一条、连自己被拒绝、收敛前发消息不卡死、`--say`/`--connect` 启动参数
+  - **界面**（headless 后端，真发 `WindowEvent`）：Esc / 遮罩 / × 关闭、点面板内部不关闭、
+    键盘跟着对话框走、空输入不发、双击「连接」、12 个结果不把面板顶出窗口
 - `crates/retexis-sim`：
   - 真 Router 过虚拟交换机：链式/环网收敛、广播恰好一次、两跳单播被 ack
   - 切断删路由、愈合恢复、150ms 延迟真的 ≥120ms、50% 丢包触发重传且不重复投递
@@ -593,6 +754,10 @@ Rust 侧覆盖的真实场景：
 - **模拟器不覆盖拨号器和 TCP 分帧**。网线是交换机插的，没有拨号过程，`HubLink` 也不存在
   粘包。这两条由 `retexis-routing` / `retexis-link-tcp` 的集成测试负责。
 - **模拟器的 `rate` 只缩放介质延迟**。路由通告的定时器在 Router 里，改不了也不该改。
+- **GUI 没有历史记录**。时间线在内存里（4000 条 / 8 MiB），关窗即消失；只能发文本，
+  二进制和文件虽然能走流，但没有选文件的界面；没有托盘和系统通知。
+- **GUI 的依赖比协议核心重得多**。`retexis-gui` 带进 242 个 crate（Slint 一整套，含
+  winit 和字体栈），并且要求 rustc 1.95；其余 11 个 crate 仍然是 1.75、无 C 工具链。
 - **流没有流控**。快发送方能把慢接收方冲垮，接收方丢弃并报 `Dropped`；真正的背压需要信用窗口。
 - **流的可靠性是逐 chunk 的**。`open_reliable` 每个 chunk 一个 ack，传大文件时 ack 流量可观。
 - **UDP 没有可靠性和分片**。丢包由重传层兜底；超过 64 KiB 的信封在发送前就被拒，不切片。
@@ -606,6 +771,7 @@ Rust 侧覆盖的真实场景：
 ## 路线图
 
 - 介质：`ws://`、`http://`（长轮询）、`radio://`（LoRa/串口，窄带分片）
+- GUI：拖文件发送（走流）、历史落盘、托盘常驻、消息已读状态
 - 发现：多播（239.x）代替广播、跨子网的中继应答、公告签名（现在谁都能应答）
 - 传输：二进制通道、流式通道（`StreamOpen/Chunk/Close` 已在线格式里）、大消息分片
 - 路由：按需路由（AODV）、多路径、链路质量度量、MPR 泛洪

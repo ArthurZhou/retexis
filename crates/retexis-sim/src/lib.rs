@@ -20,8 +20,11 @@
 
 pub mod http;
 pub mod hub;
-pub mod json;
 pub mod sim;
+
+/// Re-exported so `retexis_sim::json::Json` still names the type used by the
+/// API; the codec itself lives in `retexis-http`.
+pub use retexis_http::json;
 
 pub use hub::{Hub, HubCounters, HubLink, LinkKey, LinkParams, LinkView};
 pub use sim::{layout, Sim};

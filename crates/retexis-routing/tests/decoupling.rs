@@ -46,7 +46,9 @@ fn routing_depends_on_no_medium() {
     for forbidden in [
         "retexis-link",
         "retexis-discovery",
+        "retexis-http",
         "retexis-app",
+        "retexis-gui",
         "retexis-sim",
         "retexis-node",
         "tokio",
@@ -80,7 +82,9 @@ fn the_data_layer_depends_on_no_medium() {
     for forbidden in [
         "retexis-link",
         "retexis-discovery",
+        "retexis-http",
         "retexis-app",
+        "retexis-gui",
         "retexis-sim",
         "retexis-node",
     ] {
@@ -92,29 +96,50 @@ fn the_data_layer_depends_on_no_medium() {
 }
 
 #[test]
-fn only_the_application_layer_knows_which_media_exist() {
-    // The CLI is the composition root: the one place allowed to construct a
+fn only_application_crates_know_which_media_exist() {
+    // There are two applications — the terminal client and the GUI — and both
+    // are composition roots: they are the only places allowed to construct a
     // medium. Everything below resolves media through the registry, by scheme.
-    let app = production_dependencies("retexis-app");
-    assert!(app.contains("retexis-link-tcp"), "the CLI wires media");
-    assert!(app.contains("retexis-data"), "the CLI consumes frames");
-    assert!(app.contains("retexis-routing"), "the CLI boots a router");
+    for app in ["retexis-app", "retexis-gui"] {
+        let deps = production_dependencies(app);
+        assert!(deps.contains("retexis-link-tcp"), "{app} wires media");
+        assert!(deps.contains("retexis-data"), "{app} consumes frames");
+        assert!(deps.contains("retexis-routing"), "{app} boots a router");
+    }
 
-    // ...and the dependency only ever points inward.
+    // ...and the dependency only ever points inward: no library may depend on
+    // an application, or the application's choices become the library's.
     for krate in [
         "retexis-core",
         "retexis-crypto",
         "retexis-discovery",
+        "retexis-http",
         "retexis-link-tcp",
         "retexis-link-udp",
         "retexis-data",
         "retexis-routing",
     ] {
-        assert!(
-            !production_dependencies(krate).contains("retexis-app"),
-            "{krate} must not depend back on the application layer"
-        );
+        let deps = production_dependencies(krate);
+        for app in ["retexis-app", "retexis-gui"] {
+            assert!(!deps.contains(app), "{krate} must not depend back on {app}");
+        }
     }
+
+    // The two applications are siblings, not layers: neither is a library for
+    // the other. Sharing code between them means moving it down, not across.
+    assert!(!production_dependencies("retexis-app").contains("retexis-gui"));
+    assert!(!production_dependencies("retexis-gui").contains("retexis-app"));
+}
+
+#[test]
+fn the_http_crate_is_a_leaf() {
+    // Both applications speak HTTP to a browser. If this crate ever grew a
+    // dependency on one of them, it would stop being reusable by the other.
+    let deps = production_dependencies("retexis-http");
+    assert!(
+        deps.trim().is_empty(),
+        "retexis-http is plumbing; it must stay dependency-free, found://n{deps}"
+    );
 }
 
 #[test]
@@ -161,7 +186,9 @@ fn no_crate_pulls_in_a_c_compiler() {
         "retexis-link-tcp",
         "retexis-link-udp",
         "retexis-routing",
+        "retexis-http",
         "retexis-app",
+        "retexis-gui",
     ] {
         // Dependency lines only: a comment explaining *why* we avoid `cc`
         // must not be mistaken for a dependency on it.

@@ -1,0 +1,42 @@
+[package]
+name = "retexis-gui"
+description = "Standalone chat GUI: a real retexis node with a native window"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.95"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+retexis-core.workspace = true
+retexis-crypto.workspace = true
+retexis-data.workspace = true
+retexis-discovery.workspace = true
+retexis-link-tcp.workspace = true
+retexis-link-udp.workspace = true
+retexis-routing.workspace = true
+
+# A native window needs a newer compiler than the protocol crates; the rest of
+# the workspace stays at 1.75 so it can still build for small targets.
+#
+# Slint with the **software renderer**: no OpenGL, no GPU, no C toolchain. The
+# widgets come from `std-widgets`; the look is set with palette overrides.
+slint = { version = "1.18", default-features = false, features = [
+    "std",
+    "backend-winit",
+    "renderer-software",
+    "compat-1-2",
+] }
+
+[build-dependencies]
+slint-build = "1.18"
+
+[[bin]]
+name = "retexis-gui"
+path = "src/main.rs"
+
+[dev-dependencies]
+# Slint's headless backend: it lays the window out with fixed font metrics and
+# lets a test send real mouse and key events, so "does Esc close the dialog"
+# is answered by pressing Esc rather than by reading the code and hoping.
+i-slint-backend-testing = "1.18"

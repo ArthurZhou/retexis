@@ -4,12 +4,14 @@ members = [
     "crates/retexis-core",
     "crates/retexis-crypto",
     "crates/retexis-discovery",
+    "crates/retexis-http",
     "crates/retexis-link-tcp",
     "crates/retexis-link-udp",
     "crates/retexis-data",
     "crates/retexis-routing",
     "crates/retexis-app",
     "crates/retexis-node",
+    "crates/retexis-gui",
     "crates/retexis-sim",
 ]
 
@@ -24,12 +26,14 @@ authors = ["retexis contributors"]
 retexis-core = { path = "crates/retexis-core" }
 retexis-crypto = { path = "crates/retexis-crypto" }
 retexis-discovery = { path = "crates/retexis-discovery" }
+retexis-http = { path = "crates/retexis-http" }
 retexis-link-tcp = { path = "crates/retexis-link-tcp" }
 retexis-link-udp = { path = "crates/retexis-link-udp" }
 retexis-data = { path = "crates/retexis-data" }
 retexis-routing = { path = "crates/retexis-routing" }
 retexis-app = { path = "crates/retexis-app" }
 retexis-sim = { path = "crates/retexis-sim" }
+retexis-gui = { path = "crates/retexis-gui" }
 
 [profile.release]
 opt-level = 3

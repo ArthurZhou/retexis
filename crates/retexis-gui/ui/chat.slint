@@ -1,0 +1,989 @@
+// The window, in Slint.
+//
+// Everything here is declarative: layouts compute the geometry, the text
+// engine wraps the text, and the input is the built-in `TextInput` editor.
+//
+// Almost nothing comes from `std-widgets`. The one exception is `ScrollView`,
+// because its scrolling mechanics (wheel, drag, kinetic fling, clamping) are
+// worth having and are not worth re-deriving. Its Fluent scrollbar is *not*
+// worth having — rounded ends, its own grey, a 14px gutter — so the bar is
+// switched off and a 3px square thumb is drawn by hand at the right edge.
+//
+// Input, buttons and the scanning indicator are built from primitives
+// (`TextInput`, `Rectangle`, `TouchArea`, `Timer`) so that every corner in the
+// window is a right angle and every colour comes from `Tokens`. That includes
+// the text field, which is the one place the old version had to accept a 4px
+// radius and a Fluent border because `LineEdit` draws them itself.
+//
+// All strings that need assembling are formatted on the Rust side.
+
+import { ScrollView } from "std-widgets.slint";
+
+// ---------------------------------------------------------------- palette
+
+export global Tokens {
+    out property <color> bg: #0a0a0a;
+    out property <color> surface: #141414;
+    out property <color> card: #1e1e1e;
+    out property <color> card-hi: #282828;
+    out property <color> line: #262626;
+    out property <color> text: #f2f2f2;
+    out property <color> dim: #8c8c8c;
+    out property <color> faint: #555555;
+    out property <color> accent: #f2f2f2;
+    out property <color> accent-hover: #d2d2d2;
+    out property <color> accent-down: #b8b8b8;
+    out property <color> on-accent: #0a0a0a;
+    out property <color> on-accent-dim: #5e5e5e;
+
+    // Set from Rust (`fonts.rs`): the best family this platform actually has.
+    // A wrong guess is not fatal — Slint falls back per glyph — but a right one
+    // is what keeps CJK from rendering in whatever the system default is.
+    in-out property <string> sans: "Microsoft YaHei";
+    in-out property <string> mono: "Consolas";
+}
+
+// ---------------------------------------------------------------- data
+
+export struct EntryRow {
+    kind: int,          // 0 = message, 1 = system event
+    tag: string,        // system tag, upper case
+    sender: string,     // "ME", a name, or a short id
+    text: string,
+    meta: string,       // "12s · STREAM · DM"
+    mine: bool,
+    footer: string,     // "DELIVERED · 1075 B", empty when there is nothing to say
+}
+
+export struct PeerRow {
+    name: string,
+    meta: string,
+    hops: string,
+    selected: bool,
+}
+
+export struct FoundRow {
+    name: string,
+    id: string,
+    urls: [string],
+}
+
+// ---------------------------------------------------------------- button
+
+// A square block. No edge, no radius, no shadow — the fill is the control.
+component FlatButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    in property <bool> ghost: false;
+    // Inset for start-aligned labels (a URL reads better from the left).
+    in property <length> pad: 0px;
+    in property <bool> lead: false;
+    callback clicked;
+
+    height: 30px;
+    min-width: 72px;
+    border-radius: 0;
+    background: primary
+        ? (ta.pressed ? Tokens.accent-down : ta.has-hover ? Tokens.accent-hover : Tokens.accent)
+        : ghost
+            ? (ta.has-hover ? Tokens.card : transparent)
+            : (ta.pressed ? #333333 : ta.has-hover ? Tokens.card-hi : Tokens.card);
+    animate background { duration: 80ms; }
+
+    accessible-role: button;
+    accessible-label: root.label;
+
+    forward-focus: fs;
+
+    // The label sits in a padded layout rather than in a Text whose width is
+    // bound to the parent: that binding made the button's preferred width
+    // unknowable, and the toolbar layout answered by handing the first button
+    // all the leftover space (274px for a two-character label).
+    HorizontalLayout {
+        padding-left: 12px + root.pad;
+        padding-right: 12px + root.pad;
+        alignment: root.lead ? LayoutAlignment.start : LayoutAlignment.center;
+        Text {
+            text: root.label;
+            color: primary ? Tokens.on-accent : ghost ? Tokens.dim : Tokens.text;
+            font-size: 12.5px;
+            font-weight: primary ? 700 : 400;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    // Focus is a hairline inside the block, so the block does not resize when
+    // it gains focus.
+    Rectangle {
+        visible: fs.has-focus;
+        border-width: 1px;
+        border-color: primary ? Tokens.on-accent : Tokens.accent;
+        border-radius: 0;
+    }
+
+    fs := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Return || e.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ---------------------------------------------------------------- input
+
+// A text field with square corners: the `TextInput` editor inside a hairline
+// box that brightens when focused.
+//
+// `TextInput` does not scroll itself, so the cursor is kept in view by
+// shifting the editor left as the caret passes the right edge (and back when
+// it comes home). Without that, a long draft would just run off the end.
+component SquareInput inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <string> placeholder;
+    callback accepted(string);
+    out property <bool> has-focus: input.has-focus;
+
+    height: 32px;
+    border-radius: 0;
+    background: Tokens.card;
+    border-width: 1px;
+    border-color: input.has-focus ? Tokens.dim : Tokens.line;
+    animate border-color { duration: 110ms; }
+    clip: true;
+
+    property <length> shift: 0px;
+    changed text => {
+        if (root.text == "") {
+            root.shift = 0px;
+        }
+    }
+
+    input := TextInput {
+        x: 10px + root.shift;
+        width: max(parent.width - 20px, self.preferred-width);
+        height: parent.height;
+        vertical-alignment: center;
+        color: Tokens.text;
+        font-size: 12.5px;
+        single-line: true;
+        text-cursor-width: 1px;
+        selection-background-color: Tokens.accent;
+        selection-foreground-color: Tokens.on-accent;
+        edited => {
+            if (root.text == "") {
+                root.shift = 0px;
+            }
+        }
+        accepted => { root.accepted(root.text); }
+        cursor-position-changed(pos) => {
+            if (pos.x + root.shift < 0px) {
+                root.shift = -pos.x;
+            } else if (pos.x + root.shift > parent.width - 10px - self.text-cursor-width) {
+                root.shift = parent.width - 10px - self.text-cursor-width - pos.x;
+            }
+            if (root.shift > 0px) {
+                root.shift = 0px;
+            }
+        }
+    }
+
+    // Drawn after the editor so it sits on top; `Text` is not interactive, so
+    // clicks still reach the editor underneath.
+    if (root.text == "") : Text {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text: root.placeholder;
+        color: Tokens.faint;
+        font-size: 12.5px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    public function focus-input() { input.focus(); }
+}
+
+// ---------------------------------------------------------------- scrollbar
+
+// The square thumb. `ScrollView` still does the scrolling; this draws the only
+// visible part of the bar and lets it be dragged.
+component ThinBar inherits Rectangle {
+    in property <length> viewport;
+    in property <length> content;
+    in-out property <length> offset;   // == ScrollView.content-y, negative
+
+    out property <length> travel: max(0px, content - viewport);
+    // Nothing to scroll: no bar at all, not a disabled-looking one.
+    visible: travel > 1px;
+
+    width: 3px;
+    background: ta.pressed || ta.has-hover ? Tokens.dim : Tokens.line;
+    animate background { duration: 90ms; }
+
+    thumb := Rectangle {
+        width: parent.width;
+        height: max(24px, root.viewport * root.viewport / root.content);
+        y: (root.viewport - self.height) * clamp(-root.offset / root.travel, 0, 1);
+        background: parent.background;
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        property <length> grab-y;
+        property <length> grab-offset;
+
+        pointer-event(e) => {
+            if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) {
+                self.grab-y = self.mouse-y;
+                self.grab-offset = root.offset;
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                root.offset = clamp(
+                    self.grab-offset + (self.mouse-y - self.grab-y) * (root.travel / max(1px, root.viewport - thumb.height)),
+                    -root.travel,
+                    0px,
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- scan line
+
+// What used to be `Spinner`. A 2px block sweeping left to right says "working"
+// without borrowing Fluent's accent blue, and it stops dead when the scan ends.
+component ScanLine inherits Rectangle {
+    in property <bool> running;
+
+    height: 2px;
+    background: Tokens.line;
+    clip: true;
+
+    property <length> phase: 0px;
+    property <length> span: 64px;
+
+    Timer {
+        interval: 40ms;
+        running: root.running;
+        triggered => {
+            root.phase = root.phase + 10px;
+            if (root.phase > root.width) {
+                root.phase = -root.span;
+            }
+        }
+    }
+
+    Rectangle {
+        x: root.phase;
+        width: root.span;
+        height: parent.height;
+        background: Tokens.accent;
+    }
+}
+
+// ---------------------------------------------------------------- window
+
+export component ChatWindow inherits Window {
+    title: "retexis";
+    preferred-width: 1000px;
+    preferred-height: 700px;
+    // Below this the sidebar, the composer and the dialogs start fighting for
+    // the same pixels, so the window refuses to go there.
+    min-width: 720px;
+    min-height: 480px;
+    background: Tokens.bg;
+    default-font-family: Tokens.sans;
+    default-font-size: 13px;
+
+    in property <string> me-name;
+    in property <string> me-id;
+    in property <string> counts;
+    in property <bool> authed;
+    in property <string> addressee;
+    in property <[EntryRow]> entries;
+    in property <[PeerRow]> peers;
+
+    // 0 = none, 1 = discover, 2 = connect.
+    //
+    // One property instead of two booleans: two booleans can both be true, and
+    // then the window draws a CONNECT title over a DISCOVER body. A single
+    // value makes that state unrepresentable.
+    in-out property <int> dialog: 0;
+    property <bool> show-discover: root.dialog == 1;
+    property <bool> show-connect: root.dialog == 2;
+
+    in property <[FoundRow]> found;
+    in property <bool> scanning;
+    in property <string> error-text;
+    in-out property <string> draft;
+    in-out property <string> connect-url;
+    // Bumped by Rust when a message arrives: scroll down, but only if the
+    // reader is already at the bottom.
+    in property <int> scroll-request;
+
+    callback send(string);
+    callback select(int);
+    callback discover();
+    callback open-connect();
+    callback connect(string);
+    callback close-dialogs();
+
+
+    // One FocusScope around *everything*, including the dialogs, so a key
+    // pressed inside the composer or the address field bubbles up to the
+    // handler below. A sibling scope would only ever see keys when nothing
+    // else had focus, which is exactly never while the composer is focused.
+    root-scope := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape && root.dialog != 0) {
+                root.close-dialogs();
+                return accept;
+            }
+            return reject;
+        }
+
+        // A click on chrome that has nothing to do (the title bar, the blank
+        // space under the last message) puts the caret back in the composer.
+        // Without this a stray click leaves the window looking focused and
+        // swallowing every keystroke. Declared first, so every real control
+        // above it keeps its own clicks.
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { draft-input.focus-input(); }
+        }
+
+        VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            spacing: 0px;
+
+            // ------------------------------------------------------ header
+            header := Rectangle {
+                height: 46px;
+                background: Tokens.bg;
+
+                VerticalLayout {
+                    width: header.width;
+                    height: header.height;
+                    alignment: center;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        spacing: 8px;
+
+                        // Three nodes: the mark is the product.
+                        Rectangle {
+                            width: 16px;
+                            height: 16px;
+                            Rectangle { x: 1px; y: 2px; width: 4px; height: 4px; background: Tokens.accent; }
+                            Rectangle { x: 11px; y: 3px; width: 4px; height: 4px; background: Tokens.accent; }
+                            Rectangle { x: 6px; y: 11px; width: 4px; height: 4px; background: Tokens.accent; }
+                        }
+                        Text {
+                            text: "RETEXIS";
+                            color: Tokens.text;
+                            font-size: 14px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.me-name;
+                            color: Tokens.dim;
+                            font-size: 12.5px;
+                            vertical-alignment: center;
+                        }
+                        Text { text: "·"; color: Tokens.faint; font-size: 12.5px; vertical-alignment: center; }
+                        Text {
+                            text: root.me-id;
+                            color: Tokens.faint;
+                            font-size: 9.5px;
+                            font-family: Tokens.mono;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text {
+                            text: root.counts;
+                            color: Tokens.faint;
+                            font-size: 9.5px;
+                            font-family: Tokens.mono;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            width: tag.width + 12px;
+                            height: 20px;
+                            border-width: 1px;
+                            border-color: root.authed ? Tokens.dim : Tokens.line;
+                            border-radius: 0;
+                            tag := Text {
+                                text: root.authed ? "AUTH" : "OPEN";
+                                color: root.authed ? Tokens.text : Tokens.dim;
+                                font-size: 9.5px;
+                                font-family: Tokens.mono;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { y: parent.height - 1px; height: 1px; background: Tokens.line; }
+            }
+
+            // ------------------------------------------------------ toolbar
+            bar := Rectangle {
+                height: 50px;
+                background: Tokens.bg;
+
+                VerticalLayout {
+                    width: bar.width;
+                    height: bar.height;
+                    alignment: center;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        spacing: 8px;
+
+                        FlatButton { label: "发现"; primary: true; clicked => { root.discover(); } }
+                        // The window reports the intent; opening CONNECT also
+                        // means "stop the scan in flight", which is the
+                        // application's decision, not a layout's.
+                        FlatButton {
+                            label: "连接";
+                            clicked => { root.open-connect(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text {
+                            text: root.addressee;
+                            color: Tokens.dim;
+                            font-size: 9.5px;
+                            font-family: Tokens.mono;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Rectangle { y: parent.height - 1px; height: 1px; background: Tokens.line; }
+            }
+
+            // ------------------------------------------------------ body
+            HorizontalLayout {
+                spacing: 0px;
+                vertical-stretch: 1;
+
+                // -------------------------------------------------- sidebar
+                side := Rectangle {
+                    width: 196px;
+                    background: Tokens.surface;
+
+                    VerticalLayout {
+                        width: side.width;
+                        height: side.height;
+                        spacing: 0px;
+                        padding-top: 14px;
+
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            height: 16px;
+                            Text {
+                                text: "PEERS";
+                                color: Tokens.faint;
+                                font-size: 9px;
+                                font-weight: 700;
+                            }
+                        }
+
+                        // Index 0 of the selection model is "everyone"; without
+                        // this row the first real peer would answer to index 0
+                        // and a click on it would silently become a broadcast.
+                        Rectangle {
+                            height: 34px;
+                            background: root.addressee == "TO ALL" ? Tokens.card : all-ta.has-hover ? #1a1a1a : transparent;
+                            animate background { duration: 80ms; }
+
+                            Rectangle {
+                                visible: root.addressee == "TO ALL";
+                                width: 3px;
+                                background: Tokens.accent;
+                            }
+                            Text {
+                                x: 14px;
+                                text: "TO ALL";
+                                color: root.addressee == "TO ALL" ? Tokens.text : Tokens.dim;
+                                font-size: 10px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            all-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.select(0); }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: Tokens.line; }
+
+                        for p[i] in root.peers : Rectangle {
+                            height: 42px;
+                            background: p.selected ? Tokens.card : ta.has-hover ? #1a1a1a : transparent;
+                            animate background { duration: 80ms; }
+
+                            Rectangle {
+                                visible: p.selected;
+                                width: 3px;
+                                background: Tokens.accent;
+                            }
+                            Text {
+                                x: 14px;
+                                y: 8px;
+                                text: p.name;
+                                color: Tokens.text;
+                                font-size: 12.5px;
+                            }
+                            Text {
+                                x: 14px;
+                                y: 24px;
+                                text: p.meta;
+                                color: p.selected ? Tokens.dim : Tokens.faint;
+                                font-size: 9px;
+                                font-family: Tokens.mono;
+                            }
+                            Text {
+                                x: parent.width - 12px - self.width;
+                                y: 10px;
+                                text: p.hops;
+                                color: p.selected ? Tokens.dim : Tokens.faint;
+                                font-size: 9.5px;
+                                font-family: Tokens.mono;
+                            }
+                            ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.select(i + 1); }
+                            }
+                        }
+
+                        Rectangle { vertical-stretch: 1; }
+                    }
+
+                    Rectangle { x: parent.width - 1px; width: 1px; background: Tokens.line; }
+                }
+
+                // -------------------------------------------------- conversation
+                VerticalLayout {
+                    spacing: 0px;
+
+                    Rectangle {
+                        vertical-stretch: 1;
+
+                        // The conversation follows the bottom when new text
+                        // arrives, unless the reader has scrolled up.
+                        property <bool> at-bottom:
+                            -log.content-y >= log.content-height - log.visible-height - 24px;
+                        // `changed` needs a local name; it cannot take a
+                        // qualified one.
+                        property <int> request: root.scroll-request;
+
+                        log := ScrollView {
+                            width: parent.width;
+                            height: parent.height;
+                            // The bar is ours; ScrollView's is not drawn at all.
+                            vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                            horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+
+                            VerticalLayout {
+                                padding-left: 16px;
+                                padding-right: 20px;
+                                padding-top: 12px;
+                                padding-bottom: 12px;
+                                spacing: 9px;
+
+                                // Absorbs the leftover height so the rows keep
+                                // their own height and the conversation rests
+                                // at the bottom.
+                                Rectangle { vertical-stretch: 1; }
+
+                                if (root.entries.length == 0) : Text {
+                                    text: "NO MESSAGES YET";
+                                    color: Tokens.faint;
+                                    font-size: 11px;
+                                    font-family: Tokens.mono;
+                                    horizontal-alignment: center;
+                                    height: 120px;
+                                }
+
+                                for e in root.entries : VerticalLayout {
+                                    spacing: 0px;
+                                    // New rows fade in and settle; existing rows
+                                    // never re-animate, because the `for` model
+                                    // only creates the element once.
+                                    property <bool> fresh: false;
+                                    opacity: fresh ? 1 : 0;
+                                    animate opacity { duration: 180ms; easing: ease-out; }
+                                    init => { fresh = true; }
+
+                                    // A system event is one small line.
+                                    if (e.kind == 1) : HorizontalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: e.tag;
+                                            color: Tokens.faint;
+                                            font-size: 9.5px;
+                                            font-weight: 700;
+                                        }
+                                        Text {
+                                            text: e.text;
+                                            color: Tokens.dim;
+                                            font-size: 10.5px;
+                                            font-family: Tokens.mono;
+                                            wrap: word-wrap;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+
+                                    if (e.kind == 0) : HorizontalLayout {
+                                        spacing: 0px;
+                                        if (e.mine) : Rectangle { horizontal-stretch: 1; }
+                                        Rectangle {
+                                            max-width: log.width * 0.62;
+                                            height: body.preferred-height;
+                                            background: e.mine ? Tokens.accent : Tokens.card;
+                                            border-radius: 0;
+
+                                            body := VerticalLayout {
+                                                padding-left: 12px;
+                                                padding-right: 12px;
+                                                padding-top: 9px;
+                                                padding-bottom: 9px;
+                                                spacing: 4px;
+
+                                                HorizontalLayout {
+                                                    spacing: 6px;
+                                                    Text {
+                                                        text: e.sender;
+                                                        color: e.mine ? Tokens.on-accent : Tokens.text;
+                                                        font-size: 11px;
+                                                        font-weight: 700;
+                                                    }
+                                                    Text {
+                                                        text: e.meta;
+                                                        color: e.mine ? Tokens.on-accent-dim : Tokens.dim;
+                                                        font-size: 10px;
+                                                        font-family: Tokens.mono;
+                                                    }
+                                                    Rectangle { horizontal-stretch: 1; }
+                                                }
+                                                Text {
+                                                    text: e.text;
+                                                    color: e.mine ? Tokens.on-accent : Tokens.text;
+                                                    font-size: 14px;
+                                                    wrap: word-wrap;
+                                                }
+                                                if (e.footer != "") : Text {
+                                                    text: e.footer;
+                                                    color: e.mine ? Tokens.on-accent-dim : Tokens.dim;
+                                                    font-size: 9px;
+                                                    font-family: Tokens.mono;
+                                                    horizontal-alignment: right;
+                                                }
+                                            }
+                                        }
+                                        if (!e.mine) : Rectangle { horizontal-stretch: 1; }
+                                    }
+                                }
+                            }
+                        }
+
+                        bar-thumb := ThinBar {
+                            x: parent.width - self.width;
+                            y: 0px;
+                            height: parent.height;
+                            viewport <=> log.visible-height;
+                            content <=> log.content-height;
+                            offset <=> log.content-y;
+                        }
+
+                        changed request => {
+                            if (self.at-bottom) {
+                                log.content-y = log.visible-height - log.content-height;
+                            }
+                        }
+                    }
+
+                    // composer
+                    composer := Rectangle {
+                        height: 64px;
+                        background: Tokens.bg;
+
+                        Rectangle { y: 0px; height: 1px; background: Tokens.line; }
+
+                        VerticalLayout {
+                            width: composer.width;
+                            height: composer.height;
+                            alignment: center;
+                            HorizontalLayout {
+                                padding-left: 14px;
+                                padding-right: 14px;
+                                spacing: 8px;
+
+                                draft-input := SquareInput {
+                                    text <=> root.draft;
+                                    placeholder: "MESSAGE";
+                                    // Enter on an empty box is not a send: it
+                                    // is a person pressing Enter. Passing ""
+                                    // down would make the app answer with an
+                                    // error line about an empty message.
+                                    accepted(t) => {
+                                        if (t != "") {
+                                            root.send(t);
+                                        }
+                                    }
+                                }
+                                FlatButton {
+                                    label: "发送";
+                                    primary: true;
+                                    width: 72px;
+                                    height: 32px;
+                                    clicked => {
+                                        if (root.draft != "") {
+                                            root.send(root.draft);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (root.error-text != "") : Text {
+                            x: 14px;
+                            y: parent.height - 15px;
+                            text: root.error-text;
+                            color: Tokens.dim;
+                            font-size: 9px;
+                            font-family: Tokens.mono;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------------ dialogs
+        // A scrim under the panel: it blocks the window behind and closes on a
+        // click outside, which is what a modal is supposed to do. It stays in
+        // the tree while fading so the close is animated too, and `enabled`
+        // keeps it from eating clicks it no longer owns.
+        scrim := Rectangle {
+            opacity: 0;
+            // Open immediately, stay through the fade-out. Tying this to
+            // `opacity > 0` alone would make the dialog unreachable for the
+            // first frame of its fade-in, and forever in a headless test.
+            visible: root.dialog != 0 || self.opacity > 0;
+            background: #000000b4;
+
+            states [
+                shown when root.dialog != 0 : { opacity: 1; }
+            ]
+            animate opacity { duration: 130ms; easing: ease-out; }
+
+            TouchArea {
+                enabled: root.dialog != 0;
+                clicked => { root.close-dialogs(); }
+            }
+
+            panel := Rectangle {
+                width: root.show-connect ? 420px : 480px;
+                // Never taller than the window: a discovery result set is
+                // whatever the network happens to contain, and a panel that
+                // grows past the screen edge cannot be scrolled or dismissed.
+                height: min(sheet.preferred-height, root.height - 96px);
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: Tokens.surface;
+                border-width: 1px;
+                border-color: Tokens.line;
+                border-radius: 0;
+                clip: true;
+
+                opacity: 0;
+                states [
+                    shown when root.dialog != 0 : {
+                        opacity: 1;
+                        y: (root.height - self.height) / 2;
+                    }
+                ]
+                animate opacity, y { duration: 130ms; easing: ease-out; }
+
+                // Swallow clicks so they do not reach the scrim. Declared
+                // before the content, so the content is above it.
+                TouchArea { }
+
+                sheet := VerticalLayout {
+                    width: panel.width;
+                    padding: 16px;
+                    spacing: 10px;
+
+                    HorizontalLayout {
+                        Text {
+                            vertical-alignment: center;
+                            text: root.show-connect ? "CONNECT" : "DISCOVER";
+                            color: Tokens.text;
+                            font-size: 14px;
+                            font-weight: 700;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        FlatButton {
+                            label: "×";
+                            ghost: true;
+                            width: 24px;
+                            height: 20px;
+                            clicked => { root.close-dialogs(); }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: Tokens.line; }
+
+                    // The two bodies share one slot. Wrapping them in a spacing-0
+                    // layout is what keeps the collapsed one from leaving a gap: a
+                    // hidden block still counts as a layout item, and the sheet's
+                    // own spacing would then add 10px of nothing between them.
+                    dialog-body := VerticalLayout {
+                        spacing: 0px;
+
+                        connect-block := VerticalLayout {
+                            visible: root.show-connect;
+                            // A hidden block still counts in the layout: `visible:
+                            // false` stops the pixels, not the preferred height. So
+                            // the panel was always sized for both dialogs at once
+                            // (and the results list sat in the gap the other one
+                            // left). Collapsing the height when hidden is what
+                            // makes each dialog size itself.
+                            height: root.show-connect ? self.preferred-height : 0px;
+                            spacing: 8px;
+                            Text {
+                                text: "ADDRESS";
+                                color: Tokens.faint;
+                                font-size: 9.5px;
+                                font-weight: 700;
+                            }
+                            connect-input := SquareInput {
+                                text <=> root.connect-url;
+                                placeholder: "tcp://HOST:PORT";
+                                accepted(t) => { root.connect(t); }
+                            }
+                            FlatButton {
+                                label: "连接";
+                                primary: true;
+                                clicked => { root.connect(root.connect-url); }
+                            }
+                        }
+
+                        discover-block := VerticalLayout {
+                            visible: root.show-discover;
+                            height: root.show-discover ? self.preferred-height : 0px;
+                            spacing: 8px;
+
+                            if (root.scanning) : VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "SCANNING";
+                                    color: Tokens.dim;
+                                    font-size: 9.5px;
+                                    font-family: Tokens.mono;
+                                }
+                                ScanLine { running: root.scanning; }
+                            }
+
+                            if (!root.scanning && root.found.length == 0) : Text {
+                                text: "NO ONE ANSWERED";
+                                color: Tokens.faint;
+                                font-size: 10.5px;
+                                font-family: Tokens.mono;
+                            }
+
+                            // Capped, then scrolled: ten nodes each advertising
+                            // two URLs must not push the dialog off the screen.
+                            //
+                            // Both overrides are load-bearing. `ScrollView` ships
+                            // `preferred-height: 100%` and `vertical-stretch: 1`;
+                            // left alone, the first makes the block ask for "all of
+                            // the window" and the second hands the list every spare
+                            // pixel, so one result ends up pinned to the bottom of
+                            // a 300px hole. Sized to its content, the dialog grows
+                            // and shrinks with what it holds.
+                            ScrollView {
+                                preferred-height: min(results.preferred-height, 300px);
+                                vertical-stretch: 0;
+                                vertical-scrollbar-policy: ScrollBarPolicy.always-off;
+                                horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+
+                                results := VerticalLayout {
+                                    width: parent.width;
+                                    spacing: 12px;
+
+                                    for f in root.found : VerticalLayout {
+                                        spacing: 4px;
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            Text { text: f.name; color: Tokens.text; font-size: 12.5px; font-weight: 700; }
+                                            Text {
+                                                text: f.id;
+                                                color: Tokens.faint;
+                                                font-size: 9.5px;
+                                                font-family: Tokens.mono;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                        }
+                                        // One URL per line: a node can advertise
+                                        // several, and a horizontal row of them
+                                        // runs off the panel instead of wrapping.
+                                        for u in f.urls : FlatButton {
+                                            label: u;
+                                            height: 26px;
+                                            lead: true;
+                                            pad: 8px;
+                                            clicked => { root.connect(u); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Focus lands in the composer so the window is ready to type. Rust calls
+    // this again after `show()` — on some platforms the window manager hands
+    // focus around during mapping and takes it back.
+    public function focus-composer() {
+        draft-input.focus-input();
+    }
+
+    // Opening a dialog moves the keyboard to where the typing would go. Without
+    // this, the composer keeps focus behind the scrim and a typed address lands
+    // in a message nobody can see.
+    changed dialog => {
+        if (self.dialog == 2) {
+            connect-input.focus-input();
+        } else if (self.dialog == 1) {
+            // Nothing to type into: park focus on the window so keys still
+            // reach the Esc handler and a stray keystroke edits nothing.
+            root-scope.focus();
+        } else {
+            draft-input.focus-input();
+        }
+    }
+
+    init => {
+        root.focus-composer();
+    }
+}

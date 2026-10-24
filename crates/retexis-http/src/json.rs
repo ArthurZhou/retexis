@@ -1,9 +1,10 @@
 //! A very small JSON reader/writer.
 //!
-//! The simulator's control API is JSON, and the alternative was pulling in
-//! `serde` + `serde_json` for two hundred lines of work. The project already
-//! hand-writes its wire format; this is the same tradeoff one layer up, and it
-//! keeps the dependency set at "RustCrypto only".
+//! The control APIs of the simulator and the GUI are JSON, and the
+//! alternative was pulling in `serde` + `serde_json` for two hundred lines of
+//! work. The project already hand-writes its wire format; this is the same
+//! tradeoff one layer up, and it keeps the dependency set at "RustCrypto
+//! only".
 //!
 //! Scope is deliberately narrow: what a browser `fetch()` body and our own
 //! responses need. No comments, no trailing commas, no big decimals, no

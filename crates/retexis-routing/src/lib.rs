@@ -21,12 +21,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod connector;
 pub mod dedup;
 pub mod dial;
 pub mod limiter;
 pub mod router;
 pub mod table;
 
+pub use connector::Connector;
 pub use dial::{Dialer, ReconnectConfig};
 pub use limiter::FloodConfig;
 pub use router::start;
