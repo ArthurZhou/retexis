@@ -1,0 +1,27 @@
+<!-- The mark: three nodes and the links between them.
+
+     Vectors rather than three `Rectangle`s in the layout, so the links exist
+     at all — three dots on their own read as a stray ellipsis — and so the
+     window can rasterise the mark at the display's own scale instead of
+     blowing up a bitmap.
+
+     The triangle points up. Pointed down, the two top links and the bottom
+     node read as a "Y" (or a martini glass) at 16px; with the apex on top the
+     same three nodes read as a closed mesh.
+
+     Everything is white and opaque: the file carries shape, `chat.slint`'s
+     `colorize` carries colour, so the mark follows the header's palette. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Links first, nodes on top: the ends of each link disappear under a
+       square, which joins them cleanly without trimming every line. -->
+  <g fill="none" stroke="#ffffff" stroke-width="1.5" stroke-linecap="square">
+    <path d="M8 3 L3 12"/>
+    <path d="M8 3 L13 12"/>
+    <path d="M3 12 H13"/>
+  </g>
+  <g fill="#ffffff">
+    <rect x="6" y="1" width="4" height="4"/>
+    <rect x="1" y="10" width="4" height="4"/>
+    <rect x="11" y="10" width="4" height="4"/>
+  </g>
+</svg>

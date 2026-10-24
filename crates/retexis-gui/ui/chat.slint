@@ -212,6 +212,23 @@ component SquareInput inherits Rectangle {
     public function focus-input() { input.focus(); }
 }
 
+// ---------------------------------------------------------------- selection
+
+// The 3px accent bar that marks the chosen row.
+//
+// The geometry is spelled out rather than left to the defaults: a `Rectangle`
+// child of a `Rectangle` that only declares `width` does not sit at the left
+// edge — it landed at `(row.width - 3px) / 2`, which put a white bar in the
+// middle of the sidebar and read as a stray text cursor. `x: 0px; y: 0px` and
+// a full-height box say what the bar is, in one place, for both lists.
+component SelectionBar inherits Rectangle {
+    x: 0px;
+    y: 0px;
+    width: 3px;
+    height: 100%;
+    background: Tokens.accent;
+}
+
 // ---------------------------------------------------------------- scrollbar
 
 // The square thumb. `ScrollView` still does the scrolling; this draws the only
@@ -383,13 +400,15 @@ export component ChatWindow inherits Window {
                         padding-right: 14px;
                         spacing: 8px;
 
-                        // Three nodes: the mark is the product.
-                        Rectangle {
+                        // Three nodes and the links between them: the mark is
+                        // the product. `mark.svg` holds the shapes; `colorize`
+                        // paints them with the header's colour.
+                        Image {
                             width: 16px;
                             height: 16px;
-                            Rectangle { x: 1px; y: 2px; width: 4px; height: 4px; background: Tokens.accent; }
-                            Rectangle { x: 11px; y: 3px; width: 4px; height: 4px; background: Tokens.accent; }
-                            Rectangle { x: 6px; y: 11px; width: 4px; height: 4px; background: Tokens.accent; }
+                            source: @image-url("mark.svg");
+                            colorize: Tokens.accent;
+                            image-fit: fill;
                         }
                         Text {
                             text: "RETEXIS";
@@ -512,10 +531,8 @@ export component ChatWindow inherits Window {
                             background: root.addressee == "TO ALL" ? Tokens.card : all-ta.has-hover ? #1a1a1a : transparent;
                             animate background { duration: 80ms; }
 
-                            Rectangle {
+                            SelectionBar {
                                 visible: root.addressee == "TO ALL";
-                                width: 3px;
-                                background: Tokens.accent;
                             }
                             Text {
                                 x: 14px;
@@ -538,10 +555,8 @@ export component ChatWindow inherits Window {
                             background: p.selected ? Tokens.card : ta.has-hover ? #1a1a1a : transparent;
                             animate background { duration: 80ms; }
 
-                            Rectangle {
+                            SelectionBar {
                                 visible: p.selected;
-                                width: 3px;
-                                background: Tokens.accent;
                             }
                             Text {
                                 x: 14px;
