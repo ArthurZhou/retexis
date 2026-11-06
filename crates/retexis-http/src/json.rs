@@ -132,6 +132,7 @@ pub fn parse(input: &str) -> Result<Json, String> {
     let mut p = Parser {
         b: input.as_bytes(),
         i: 0,
+        depth: 0,
     };
     p.ws();
     let v = p.value()?;
@@ -142,9 +143,17 @@ pub fn parse(input: &str) -> Result<Json, String> {
     Ok(v)
 }
 
+/// How deep `[[[[...` may go before the parser refuses.
+///
+/// The body limit is 1 MiB, which is enough for half a million nested arrays —
+/// each one a stack frame. A parser that recurses per level turns a one-line
+/// request into a stack overflow, which is a process abort, not a 400.
+const MAX_DEPTH: u32 = 64;
+
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
+    depth: u32,
 }
 
 impl Parser<'_> {
@@ -170,8 +179,8 @@ impl Parser<'_> {
     fn value(&mut self) -> Result<Json, String> {
         match self.peek() {
             None => Err("unexpected end of input".into()),
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') => self.nested(Self::object),
+            Some(b'[') => self.nested(Self::array),
             Some(b'"') => Ok(Json::Str(self.string()?)),
             Some(b't') => self.literal("true", Json::Bool(true)),
             Some(b'f') => self.literal("false", Json::Bool(false)),
@@ -179,6 +188,22 @@ impl Parser<'_> {
             Some(c) if c == b'-' || c.is_ascii_digit() => self.number(),
             Some(c) => Err(format!("unexpected byte 0x{c:02x} at offset {}", self.i)),
         }
+    }
+
+    /// Runs `f`, counting one level of nesting and refusing to go deeper than
+    /// [`MAX_DEPTH`]. Recursion has to be bounded somewhere; this is where.
+    fn nested(&mut self, f: fn(&mut Self) -> Result<Json, String>) -> Result<Json, String> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return Err(format!(
+                "json nested deeper than {MAX_DEPTH} levels at offset {}",
+                self.i
+            ));
+        }
+        let out = f(self);
+        self.depth -= 1;
+        out
     }
 
     fn literal(&mut self, word: &str, value: Json) -> Result<Json, String> {
@@ -386,5 +411,22 @@ mod tests {
         assert!(parse("{\"a\":}").is_err());
         assert!(parse("[1,]").is_err());
         assert!(parse("nul").is_err());
+    }
+
+    #[test]
+    fn deep_nesting_is_refused_instead_of_overflowing_the_stack() {
+        // 1 MiB of '[' is a legal body and half a million stack frames.
+        let deep = "[".repeat(100_000);
+        let err = parse(&deep).expect_err("must refuse, not recurse");
+        assert!(err.contains("nested"), "{err}");
+
+        let deep_obj = "{\"a\":".repeat(100_000);
+        assert!(parse(&deep_obj).is_err());
+    }
+
+    #[test]
+    fn ordinary_nesting_still_works() {
+        let text = format!("{}1{}", "[".repeat(60), "]".repeat(60));
+        assert!(parse(&text).is_ok(), "60 levels is well within the limit");
     }
 }

@@ -31,12 +31,17 @@
 //!   reliable as the medium.
 //! * **No flow control.** A receiver that cannot buffer drops the stream and
 //!   says [`StreamEvent::Dropped`]. Real backpressure needs a credit window.
+//!   What it does have is a hard ceiling per stream ([`MAX_STREAM_BYTES`]) and
+//!   an idle deadline ([`STREAM_IDLE`]): without those, one sender that never
+//!   closes fills every slot the assembler has and the node stops accepting
+//!   streams for the rest of its life.
 
 use crate::frame::{Frame, InboundFrame, MAX_FRAME_PAYLOAD};
 use retexis_core::{ContentType, MessageId, NodeId};
 use retexis_routing::{MeshHandle, SendError};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 /// Envelope overhead inside a stream payload: `u64 id` + `u32 seq`.
 const CHUNK_HEADER: usize = 12;
@@ -45,6 +50,54 @@ const OPEN_HEADER: usize = 9;
 /// `u64 id` + `u32 chunks`.
 const CLOSE_HEADER: usize = 12;
 const MAX_NAME: usize = 64;
+
+/// Bytes one half-received stream may hold before it is given up on.
+///
+/// Memory is the one resource a sender can spend on the receiver's behalf, so
+/// it needs a ceiling even though the protocol has no flow control: past this
+/// point the stream is dropped and reported, which is the honest failure —
+/// "we cannot take this" — instead of an allocation that ends in a killed
+/// process.
+pub const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long a stream may go without a frame before it is abandoned.
+///
+/// `Close` is a single packet; on a lossy medium losing it is routine. The
+/// stream it belonged to would otherwise hold one of the [`StreamAssembler`]'s
+/// slots forever, and after 64 such losses a node would refuse every new
+/// stream.
+pub const STREAM_IDLE: Duration = Duration::from_secs(30);
+
+/// How often `accept` looks for abandoned streams. Cheap (a scan of at most
+/// `max_open` entries) but not free, so not on every chunk.
+const SWEEP_EVERY: Duration = Duration::from_secs(1);
+
+/// How many payload bytes one chunk may carry on the links we have right now.
+///
+/// The medium owns the frame limit ([`Link::max_frame`](retexis_core::Link)) and
+/// the router drops an envelope that does not fit (`DropReason::TooLarge`)
+/// instead of fragmenting it, so a chunk that is too big for the medium is not
+/// a slow chunk — it is a hole with nothing to report. Sizing from the narrowest
+/// attached link is the conservative answer: the path to `dst` is not known
+/// before the route converges, and being too small costs a few header bytes per
+/// chunk, while being too large loses the data.
+///
+/// `None` when nothing is attached yet: a node can open a stream before its
+/// first link comes up, and the chunks then travel once it does.
+fn chunk_budget(handle: &MeshHandle, channel: &str) -> usize {
+    let ceiling = MAX_FRAME_PAYLOAD - CHUNK_HEADER;
+    // Envelope overhead for a chunk on this channel: the header plus the
+    // per-frame bookkeeping, plus the auth tag. The tag is always reserved,
+    // not only when this node has a key: the alternative is a chunk size that
+    // fits an unauthenticated hop and is 16 bytes too big on an authenticated
+    // one, which turns a narrow link into a silent black hole.
+    let overhead = retexis_core::Envelope::data_len(channel, CHUNK_HEADER)
+        + retexis_core::AUTH_TAG_LEN;
+    match handle.links().iter().map(|l| l.max_frame).min() {
+        Some(narrowest) => narrowest.saturating_sub(overhead).clamp(1, ceiling),
+        None => ceiling,
+    }
+}
 
 /// Identifies one stream between two nodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -155,6 +208,7 @@ impl<'a> StreamSender<'a> {
 
         let frame = Frame::new(channel.clone(), ContentType::StreamOpen, payload);
         send_one(handle, dst, frame, reliable)?;
+        let chunk_size = chunk_budget(handle, &channel);
 
         Ok(StreamSender {
             handle,
@@ -166,7 +220,9 @@ impl<'a> StreamSender<'a> {
             bytes: 0,
             closed: false,
             reliable,
-            chunk_size: MAX_FRAME_PAYLOAD - CHUNK_HEADER,
+            // Not the compile-time maximum: a narrow medium would drop the
+            // chunks. See `chunk_budget`.
+            chunk_size,
         })
     }
 
@@ -320,6 +376,11 @@ pub enum StreamDropReason {
     OutOfWindow,
     /// `Close` arrived but chunks were still missing.
     MissingChunks,
+    /// The stream held more than [`MAX_STREAM_BYTES`] before delivering it.
+    TooManyBytes,
+    /// No frame arrived for [`STREAM_IDLE`]; the sender is gone or the `Close`
+    /// was lost.
+    Stalled,
 }
 
 impl fmt::Display for StreamDropReason {
@@ -328,11 +389,16 @@ impl fmt::Display for StreamDropReason {
             StreamDropReason::TooManyStreams => f.write_str("too many concurrent streams"),
             StreamDropReason::OutOfWindow => f.write_str("chunk outside the reorder window"),
             StreamDropReason::MissingChunks => f.write_str("closed with chunks missing"),
+            StreamDropReason::TooManyBytes => f.write_str("stream exceeded its memory budget"),
+            StreamDropReason::Stalled => f.write_str("no traffic before the idle deadline"),
         }
     }
 }
 
 struct Pending {
+    /// Channel the stream was opened on; a stalled stream still has to be
+    /// reported to *its* sink, not to whoever happens to be dispatching.
+    channel: String,
     name: String,
     broadcast: bool,
     hops: u8,
@@ -340,7 +406,32 @@ struct Pending {
     next: u32,
     /// Chunks that arrived early, waiting for the gap to fill.
     buffered: BTreeMap<u32, Vec<u8>>,
+    /// Bytes already handed to the sink.
     bytes: usize,
+    /// Bytes sitting in `buffered`, so the budget check is O(1).
+    buffered_bytes: usize,
+    /// Last frame seen for this stream; drives the idle deadline.
+    last_seen: Instant,
+}
+
+impl Pending {
+    fn new(channel: String, name: String, broadcast: bool, hops: u8, now: Instant) -> Self {
+        Pending {
+            channel,
+            name,
+            broadcast,
+            hops,
+            next: 0,
+            buffered: BTreeMap::new(),
+            bytes: 0,
+            buffered_bytes: 0,
+            last_seen: now,
+        }
+    }
+
+    fn held(&self) -> usize {
+        self.bytes + self.buffered_bytes
+    }
 }
 
 /// Reassembles streams from inbound frames.
@@ -351,6 +442,8 @@ pub struct StreamAssembler {
     open: HashMap<(NodeId, u64), Pending>,
     max_open: usize,
     window: u32,
+    /// When the next opportunistic sweep is due.
+    next_sweep: Instant,
 }
 
 impl Default for StreamAssembler {
@@ -365,6 +458,7 @@ impl StreamAssembler {
             open: HashMap::new(),
             max_open: 64,
             window: 256,
+            next_sweep: Instant::now() + SWEEP_EVERY,
         }
     }
 
@@ -372,9 +466,52 @@ impl StreamAssembler {
         self.open.len()
     }
 
+    /// Abandons streams that have been silent for longer than `idle`.
+    ///
+    /// Public so a caller with its own clock (a test, a simulator) can drive
+    /// it; [`accept`](Self::accept) calls it on its own every second.
+    pub fn expire(&mut self, now: Instant, idle: Duration) -> Vec<StreamEvent> {
+        let dead: Vec<(NodeId, u64)> = self
+            .open
+            .iter()
+            .filter(|(_, p)| now.saturating_duration_since(p.last_seen) > idle)
+            .map(|(k, _)| *k)
+            .collect();
+        let mut out = Vec::new();
+        for key in dead {
+            if let Some(p) = self.open.remove(&key) {
+                out.push(StreamEvent::Dropped {
+                    from: key.0,
+                    channel: p.channel,
+                    id: StreamId(key.1),
+                    name: p.name,
+                    reason: StreamDropReason::Stalled,
+                });
+            }
+        }
+        out
+    }
+
     /// Feeds one inbound frame. Returns the events it produced: none for a
     /// duplicate, one for a normal chunk, several when a gap finally fills.
+    ///
+    /// Once a second it also returns `Dropped{Stalled}` for streams that have
+    /// gone quiet, so a lost `Close` frees its slot instead of holding it
+    /// forever.
     pub fn accept(&mut self, frame: &InboundFrame) -> Vec<StreamEvent> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        // Sweep when the timer is up *or* when the table is full: a dead
+        // stream must never be the reason a live one is refused.
+        if now >= self.next_sweep || self.open.len() >= self.max_open {
+            self.next_sweep = now + SWEEP_EVERY;
+            out.extend(self.expire(now, STREAM_IDLE));
+        }
+        out.extend(self.accept_at(frame, now));
+        out
+    }
+
+    fn accept_at(&mut self, frame: &InboundFrame, now: Instant) -> Vec<StreamEvent> {
         let channel = frame.frame.channel.clone();
         let from = frame.from;
         let payload = &frame.frame.payload;
@@ -398,14 +535,13 @@ impl StreamAssembler {
                 }
                 self.open.insert(
                     (from, id.0),
-                    Pending {
-                        name: name.clone(),
-                        broadcast: frame.broadcast,
-                        hops: frame.hops,
-                        next: 0,
-                        buffered: BTreeMap::new(),
-                        bytes: 0,
-                    },
+                    Pending::new(
+                        channel.clone(),
+                        name.clone(),
+                        frame.broadcast,
+                        frame.hops,
+                        now,
+                    ),
                 );
                 vec![StreamEvent::Opened {
                     from,
@@ -437,16 +573,9 @@ impl StreamAssembler {
                     }
                     self.open.insert(
                         (from, id.0),
-                        Pending {
-                            name: String::new(),
-                            // No `Open` was seen, so this frame is all we
-                            // know about the stream's routing.
-                            broadcast: frame.broadcast,
-                            hops: frame.hops,
-                            next: 0,
-                            buffered: BTreeMap::new(),
-                            bytes: 0,
-                        },
+                        // No `Open` was seen, so this frame is all we know
+                        // about the stream's routing.
+                        Pending::new(channel.clone(), String::new(), frame.broadcast, frame.hops, now),
                     );
                     adopted = true;
                 }
@@ -462,32 +591,82 @@ impl StreamAssembler {
                         hops: frame.hops,
                     });
                 }
-                let pending = self.open.get_mut(&(from, id.0)).expect("just inserted");
-                if seq < pending.next {
-                    return Vec::new(); // already delivered
+
+                // One scope for the borrow, because two of the outcomes have
+                // to remove the entry.
+                enum Verdict {
+                    Kept,
+                    Replay,
+                    OutOfWindow,
+                    TooManyBytes,
                 }
-                if seq > pending.next + self.window {
-                    return vec![StreamEvent::Dropped {
+                let verdict = {
+                    let pending = self.open.get_mut(&(from, id.0)).expect("just inserted");
+                    pending.last_seen = now;
+                    if seq < pending.next {
+                        Verdict::Replay
+                    } else if seq > pending.next.saturating_add(self.window) {
+                        // `saturating_add`: `next + window` must not wrap, or a
+                        // chunk at the end of the u32 range moves the edge.
+                        Verdict::OutOfWindow
+                    } else {
+                        // Replacing a buffered seq must not double-count it.
+                        if let Some(old) = pending.buffered.insert(seq, data.to_vec()) {
+                            pending.buffered_bytes =
+                                pending.buffered_bytes.saturating_sub(old.len());
+                        }
+                        pending.buffered_bytes =
+                            pending.buffered_bytes.saturating_add(data.len());
+                        if pending.held() > MAX_STREAM_BYTES {
+                            Verdict::TooManyBytes
+                        } else {
+                            // Release everything contiguous, in order.
+                            while let Some(chunk) = pending.buffered.remove(&pending.next) {
+                                pending.bytes += chunk.len();
+                                pending.buffered_bytes =
+                                    pending.buffered_bytes.saturating_sub(chunk.len());
+                                pending.next += 1;
+                                out.push(StreamEvent::Data {
+                                    from,
+                                    channel: channel.clone(),
+                                    id,
+                                    chunk,
+                                });
+                            }
+                            Verdict::Kept
+                        }
+                    }
+                };
+
+                match verdict {
+                    Verdict::Kept => out,
+                    Verdict::Replay => Vec::new(),
+                    Verdict::OutOfWindow => vec![StreamEvent::Dropped {
                         from,
                         channel,
                         id,
-                        name: pending.name.clone(),
+                        name: self
+                            .open
+                            .get(&(from, id.0))
+                            .map(|p| p.name.clone())
+                            .unwrap_or_default(),
                         reason: StreamDropReason::OutOfWindow,
-                    }];
+                    }],
+                    Verdict::TooManyBytes => {
+                        let name = self
+                            .open
+                            .remove(&(from, id.0))
+                            .map(|p| p.name)
+                            .unwrap_or_default();
+                        vec![StreamEvent::Dropped {
+                            from,
+                            channel,
+                            id,
+                            name,
+                            reason: StreamDropReason::TooManyBytes,
+                        }]
+                    }
                 }
-                pending.buffered.insert(seq, data.to_vec());
-                // Release everything contiguous, in order.
-                while let Some(chunk) = pending.buffered.remove(&pending.next) {
-                    pending.bytes += chunk.len();
-                    pending.next += 1;
-                    out.push(StreamEvent::Data {
-                        from,
-                        channel: channel.clone(),
-                        id,
-                        chunk,
-                    });
-                }
-                out
             }
             ContentType::StreamClose => {
                 let Some((id, chunks)) = parse_close(payload) else {
@@ -783,5 +962,124 @@ mod tests {
         let b = StreamId::random();
         assert_ne!(a, b);
         assert_eq!(a.short().len(), 8);
+    }
+
+    #[test]
+    fn a_full_table_does_not_refuse_a_live_stream_forever() {
+        // 64 streams whose `Close` never arrived used to be a permanent
+        // denial: the assembler had no way to reclaim a slot, so every later
+        // stream was refused for the life of the process.
+        let mut asm = StreamAssembler::new();
+        let from = peer();
+        for i in 0..64u64 {
+            asm.accept(&open_frame(from, StreamId(1000 + i), "orphan"));
+        }
+        assert_eq!(asm.open_streams(), 64);
+
+        // The next one is refused while the slots really are in use...
+        let out = asm.accept(&open_frame(from, StreamId(2000), "new"));
+        assert!(matches!(
+            &out[0],
+            StreamEvent::Dropped {
+                reason: StreamDropReason::TooManyStreams,
+                ..
+            }
+        ));
+
+        // ...but once the orphans are stale, the next frame reclaims them and
+        // the stream is accepted.
+        let later = Instant::now() + STREAM_IDLE + Duration::from_secs(1);
+        asm.expire(later, STREAM_IDLE);
+        assert_eq!(asm.open_streams(), 0);
+        let out = asm.accept(&open_frame(from, StreamId(2001), "new"));
+        assert!(matches!(&out[0], StreamEvent::Opened { .. }));
+    }
+
+    #[test]
+    fn a_stream_that_goes_quiet_is_given_up_on() {
+        // Losing the `Close` is routine on a lossy medium. If the slot were
+        // never reclaimed, 64 such losses would make the node refuse every
+        // stream for the rest of its life.
+        let mut asm = StreamAssembler::new();
+        let from = peer();
+        let id = StreamId(101);
+        asm.accept(&open_frame(from, id, "stuck"));
+        asm.accept(&chunk_frame(from, id, 0, b"half"));
+        assert_eq!(asm.open_streams(), 1);
+
+        let later = Instant::now() + STREAM_IDLE + Duration::from_secs(1);
+        let out = asm.expire(later, STREAM_IDLE);
+        assert_eq!(out.len(), 1, "the stalled stream should be reported");
+        assert!(matches!(
+            &out[0],
+            StreamEvent::Dropped {
+                reason: StreamDropReason::Stalled,
+                id: dropped,
+                ..
+            } if *dropped == id
+        ));
+        assert_eq!(out[0].channel(), "file", "the event keeps its channel");
+        assert_eq!(asm.open_streams(), 0, "the slot is free again");
+
+        // ...and a fresh stream can use it.
+        asm.accept(&open_frame(from, StreamId(102), "next"));
+        assert_eq!(asm.open_streams(), 1);
+    }
+
+    #[test]
+    fn an_active_stream_is_not_expired() {
+        let mut asm = StreamAssembler::new();
+        let from = peer();
+        let id = StreamId(103);
+        asm.accept(&open_frame(from, id, "slow"));
+        asm.accept(&chunk_frame(from, id, 0, b"a"));
+        let idle = STREAM_IDLE / 2;
+        asm.accept(&chunk_frame(from, id, 1, b"b"));
+        assert!(asm.expire(Instant::now() + idle / 2, idle).is_empty());
+        assert_eq!(asm.open_streams(), 1);
+    }
+
+    #[test]
+    fn a_stream_cannot_buffer_without_limit() {
+        // One sender must not be able to spend all of the receiver's memory:
+        // a chunk that never becomes deliverable still costs a buffer.
+        let mut asm = StreamAssembler::new();
+        let from = peer();
+        let id = StreamId(105);
+        asm.accept(&open_frame(from, id, "flood"));
+        asm.accept(&chunk_frame(from, id, 0, b"start"));
+
+        let big = vec![7u8; 64 * 1024];
+        let mut dropped = None;
+        for seq in 1..1000u32 {
+            let out = asm.accept(&chunk_frame(from, id, seq, &big));
+            if let Some(StreamEvent::Dropped { reason, .. }) = out.first() {
+                dropped = Some(*reason);
+                break;
+            }
+        }
+        assert_eq!(
+            dropped,
+            Some(StreamDropReason::TooManyBytes),
+            "the budget must stop an endless buffered stream"
+        );
+        assert_eq!(asm.open_streams(), 0, "the slot is given back");
+    }
+
+    #[test]
+    fn a_window_edge_does_not_wrap_at_the_end_of_the_sequence_space() {
+        let mut asm = StreamAssembler::new();
+        let from = peer();
+        let id = StreamId(107);
+        asm.accept(&open_frame(from, id, ""));
+        // A sender that has somehow reached the top of the u32 space: the
+        // window check must not wrap into "this chunk is fine".
+        asm.accept(&chunk_frame(from, id, u32::MAX - 1, b"x"));
+        let out = asm.accept(&chunk_frame(from, id, u32::MAX, b"y"));
+        assert!(
+            out.iter()
+                .all(|e| !matches!(e, StreamEvent::Data { .. })),
+            "chunks beyond the window must never be delivered"
+        );
     }
 }

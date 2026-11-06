@@ -18,6 +18,7 @@ use retexis_link_udp::UdpFactory;
 use retexis_routing::{
     Connector, MeshHandle, NoticeSink, ReconnectConfig, RouterConfig, RouterNotice,
 };
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,6 +33,10 @@ pub struct Boot {
     pub listening: Vec<String>,
     /// Kept alive for the whole run: dropping it stops answering queries.
     pub responder: Option<discovery::Responder>,
+    /// The port we actually answer on, when we answer at all. The window shows
+    /// it, because "can anyone find me?" is not a question a person should have
+    /// to read a terminal to answer.
+    pub announced: Option<SocketAddr>,
     /// Non-fatal problems, in the order they happened, for `main` to print.
     pub warnings: Vec<String>,
 }
@@ -135,16 +140,23 @@ pub fn boot(opts: &Options) -> Result<Boot, String> {
     }
 
     // --- discovery: answer queries ------------------------------------------
+    // The whole span is offered, not one port: a second window on this machine
+    // must still be findable, and the first one already holds 47700.
     let announcement = Announcement::reply(node_id, name.clone(), endpoints.clone());
+    let mut announced = None;
     let responder = if opts.announce && !endpoints.is_empty() {
-        match discovery::respond(announcement, opts.discovery_port) {
-            Ok(r) => Some(r),
+        match discovery::respond_on(announcement, opts.discovery_port, discovery::PORT_SPAN) {
+            Ok(r) => {
+                announced = Some(r.addr());
+                Some(r)
+            }
             Err(e) => {
-                // Another instance on this host usually holds the port. Not
-                // fatal: we can still dial, we just cannot be found.
+                // Every port in the span is taken. Not fatal: we can still
+                // dial, we just cannot be found.
                 warnings.push(format!(
-                    "cannot answer discovery on {}: {e}",
-                    opts.discovery_port
+                    "cannot answer discovery on {}+{}: {e}",
+                    opts.discovery_port,
+                    discovery::PORT_SPAN
                 ));
                 None
             }
@@ -215,6 +227,7 @@ pub fn boot(opts: &Options) -> Result<Boot, String> {
         endpoints,
         listening,
         responder,
+        announced,
         warnings,
     })
 }

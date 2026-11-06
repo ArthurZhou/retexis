@@ -337,6 +337,11 @@ export component ChatWindow inherits Window {
     in property <string> me-name;
     in property <string> me-id;
     in property <string> counts;
+    // "FINDABLE :47700" or "HIDDEN": whether a peer's scan can see this node.
+    // Discovery is the one feature whose failure is silent — the window looks
+    // perfectly healthy while answering nobody — so it gets a line in the
+    // header rather than a warning in a terminal nobody is looking at.
+    in property <string> findable;
     in property <bool> authed;
     in property <string> addressee;
     in property <[EntryRow]> entries;
@@ -448,6 +453,15 @@ export component ChatWindow inherits Window {
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; }
+                        // Dimmer than `counts` when discoverable, brighter when
+                        // not: HIDDEN is the state that needs the eye.
+                        Text {
+                            text: root.findable;
+                            color: root.findable == "HIDDEN" ? Tokens.dim : Tokens.faint;
+                            font-size: 9.5px;
+                            font-family: Tokens.mono;
+                            vertical-alignment: center;
+                        }
                         Text {
                             text: root.counts;
                             color: Tokens.faint;
@@ -938,6 +952,18 @@ export component ChatWindow inherits Window {
                             font-weight: 700;
                         }
                         Rectangle { horizontal-stretch: 1; }
+                        // A peer that joined after the last scan is one click
+                        // away instead of close-and-reopen. Pressing it while a
+                        // scan is running restarts the window; that is the
+                        // obvious meaning of "scan again" and needs no
+                        // disabled state to explain itself.
+                        if (root.show-discover) : FlatButton {
+                            label: "重扫";
+                            ghost: true;
+                            height: 24px;
+                            min-width: 52px;
+                            clicked => { root.discover(); }
+                        }
                         FlatButton {
                             label: "×";
                             ghost: true;

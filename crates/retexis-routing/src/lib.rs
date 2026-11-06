@@ -348,6 +348,10 @@ pub struct Stats {
     pub flood_suppressed: u64,
     /// Redundant links closed by the duplicate-link rule.
     pub duplicate_links: u64,
+    /// Acks that arrived from a node we never sent that message to.
+    pub acks_rejected: u64,
+    /// Route entries refused because the table is at its ceiling.
+    pub route_table_full: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -580,39 +584,92 @@ impl MeshHandle {
         self.status().routes
     }
 
-    /// Resolves a user typed token to a node id. Accepts a full hex id, a
-    /// short hex id, or a peer name (case insensitive, then substring).
-    pub fn resolve(&self, token: &str) -> Option<NodeId> {
+    /// Every node that matches a user typed token, best tier first.
+    ///
+    /// Tiers, in order: full/short node id, exact name, name prefix, name
+    /// substring, short-hex id. The first non-empty tier wins outright — a
+    /// prefix match never competes with an exact name — and the result is
+    /// sorted so the same input always produces the same list.
+    ///
+    /// Returning the whole tier rather than one entry is what makes
+    /// [`resolve`](Self::resolve) safe: with several "bob"s in the mesh,
+    /// picking whichever one the hash map happened to yield first would send a
+    /// private message to the wrong person.
+    pub fn resolve_matches(&self, token: &str) -> Vec<NodeId> {
         let t = token.trim();
         if t.is_empty() {
-            return None;
-        }
-        if let Some(id) = NodeId::parse_loose(t) {
-            if id == self.me {
-                return Some(id);
-            }
-            let st = self.status();
-            if st.names.contains_key(&id) || st.routes.iter().any(|r| r.dst == id) {
-                return Some(id);
-            }
-            // Fall through: the id may be a short form of a known peer.
+            return Vec::new();
         }
         let st = self.status();
-        let lower = t.to_ascii_lowercase();
-        if let Some((id, _)) = st.names.iter().find(|(_, n)| n.eq_ignore_ascii_case(t)) {
-            return Some(*id);
+
+        // A full or short hex id identifies exactly one node, or none.
+        if let Some(id) = NodeId::parse_loose(t) {
+            if id == self.me
+                || st.names.contains_key(&id)
+                || st.routes.iter().any(|r| r.dst == id)
+            {
+                return vec![id];
+            }
         }
-        if let Some((id, _)) = st
+
+        let lower = t.to_ascii_lowercase();
+        let mut names: Vec<(NodeId, String)> = st
             .names
             .iter()
-            .find(|(_, n)| n.to_ascii_lowercase().contains(&lower))
-        {
-            return Some(*id);
+            .map(|(id, name)| (*id, name.to_ascii_lowercase()))
+            .collect();
+        // Our own name is not in `names` (that map is filled by what peers tell
+        // us), but `/msg <my-own-name>` should still resolve — otherwise the
+        // one name a user is most likely to type is the one that says "unknown
+        // peer".
+        if !self.name.is_empty() {
+            names.push((self.me, self.name.to_ascii_lowercase()));
         }
-        st.names
+
+        let mut tier: Vec<NodeId> = names
             .iter()
-            .find(|(id, _)| id.short() == lower)
+            .filter(|(_, n)| *n == lower)
             .map(|(id, _)| *id)
+            .collect();
+        if tier.is_empty() {
+            tier = names
+                .iter()
+                .filter(|(_, n)| n.starts_with(&lower))
+                .map(|(id, _)| *id)
+                .collect();
+        }
+        if tier.is_empty() {
+            tier = names
+                .iter()
+                .filter(|(_, n)| n.contains(&lower))
+                .map(|(id, _)| *id)
+                .collect();
+        }
+        if tier.is_empty() {
+            tier = st
+                .names
+                .keys()
+                .copied()
+                .filter(|id| id.short() == lower)
+                .collect();
+        }
+        tier.sort_by_key(|id| id.short());
+        tier.dedup();
+        tier
+    }
+
+    /// Resolves a token to exactly one node id.
+    ///
+    /// `None` when nothing matches *or* when more than one does — a caller
+    /// that cannot show the choice must not pick one. Use
+    /// [`resolve_matches`](Self::resolve_matches) to report the ambiguity.
+    pub fn resolve(&self, token: &str) -> Option<NodeId> {
+        let mut matches = self.resolve_matches(token);
+        if matches.len() == 1 {
+            matches.pop()
+        } else {
+            None
+        }
     }
 
     /// Asks the router to stop. The router sends `Bye` to every neighbour and

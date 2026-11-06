@@ -40,6 +40,19 @@ use std::time::{Duration, Instant};
 /// deadline. Small enough to keep scans snappy, large enough not to spin.
 const SLICE: Duration = Duration::from_millis(50);
 
+/// Consecutive ports a node may answer discovery on.
+///
+/// Several nodes on one host is the normal case while developing (two windows,
+/// or a window and a CLI node), and only one process can bind a given UDP port.
+/// Walking the range the way the TCP listener walks 7100..7110 is what keeps
+/// the second one from silently becoming unfindable.
+pub const PORT_SPAN: u16 = 8;
+
+/// `base..base + span`, stopping at the end of the port space.
+fn ports(base: u16, span: u16) -> impl Iterator<Item = u16> {
+    (0..span.max(1)).filter_map(move |i| base.checked_add(i))
+}
+
 /// A beacon that speaks IP broadcast.
 ///
 /// It holds no socket: every `broadcast`/`discover` call uses a fresh
@@ -78,11 +91,27 @@ pub fn local_ip() -> Option<std::net::IpAddr> {
 pub struct BroadcastBeacon {
     scheme: &'static str,
     port: u16,
+    /// Ports asked, starting at `port`. One for a single-port caller, the
+    /// whole [`PORT_SPAN`] for an application that shares a host.
+    span: u16,
 }
 
 impl BroadcastBeacon {
     pub fn new(scheme: &'static str, port: u16) -> Self {
-        BroadcastBeacon { scheme, port }
+        BroadcastBeacon {
+            scheme,
+            port,
+            span: 1,
+        }
+    }
+
+    /// Ask `span` consecutive ports instead of one.
+    ///
+    /// A responder that found 47700 busy binds 47701, so a query to 47700
+    /// alone would never see it.
+    pub fn with_span(mut self, span: u16) -> Self {
+        self.span = span.max(1);
+        self
     }
 
     pub fn port(&self) -> u16 {
@@ -90,14 +119,15 @@ impl BroadcastBeacon {
     }
 
     /// Where a probe goes: the limited broadcast address, plus loopback so a
-    /// single host can discover itself.
+    /// single host can discover itself — for every port in the span.
     fn destinations(&self) -> Vec<SocketAddr> {
-        let mut out = Vec::with_capacity(2);
-        if let Ok(a) = format!("255.255.255.255:{}", self.port).parse() {
-            out.push(a);
-        }
-        if let Ok(a) = format!("127.0.0.1:{}", self.port).parse() {
-            out.push(a);
+        let mut out = Vec::with_capacity(2 * self.span as usize);
+        for port in ports(self.port, self.span) {
+            for host in ["255.255.255.255", "127.0.0.1"] {
+                if let Ok(a) = format!("{host}:{port}").parse() {
+                    out.push(a);
+                }
+            }
         }
         out
     }
@@ -144,7 +174,10 @@ impl Beacon for BroadcastBeacon {
         let mut found: Vec<Announcement> = Vec::new();
         while Instant::now() < deadline {
             let left = deadline.saturating_duration_since(Instant::now());
-            sock.set_read_timeout(Some(left.min(SLICE)))
+            // At least a microsecond: a zero timeout is rejected by the OS on
+            // some platforms, and the loop is about to end anyway.
+            let slice = left.min(SLICE).max(Duration::from_micros(1));
+            sock.set_read_timeout(Some(slice))
                 .map_err(LinkError::io)?;
             match sock.recv_from(&mut buf) {
                 Ok((n, _from)) => {
@@ -212,6 +245,30 @@ impl Drop for Responder {
 /// Pass port 0 to let the OS choose (the bound port comes back from
 /// [`Responder::addr`]), which is how tests avoid fighting over 47700.
 pub fn respond(announcement: Announcement, port: u16) -> io::Result<Responder> {
+    respond_on(announcement, port, 1)
+}
+
+/// Binds the first free port in `base..base + span`, and answers there.
+///
+/// "First free" rather than "the port or nothing": the second window on a host
+/// has no business being invisible just because the first one got there first.
+/// `Responder::addr` and the banner report which port was actually taken.
+pub fn respond_on(announcement: Announcement, base: u16, span: u16) -> io::Result<Responder> {
+    let mut last = None;
+    for port in ports(base, span) {
+        match bind_one(announcement.clone(), port) {
+            Ok(responder) => return Ok(responder),
+            // Keep the last error: when every port is taken, "address in use"
+            // is the sentence that explains it.
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AddrNotAvailable, "no discovery port available")
+    }))
+}
+
+fn bind_one(announcement: Announcement, port: u16) -> io::Result<Responder> {
     let socket = UdpSocket::bind(format!("0.0.0.0:{port}"))?;
     socket.set_read_timeout(Some(SLICE))?;
     let addr = socket.local_addr()?;
@@ -337,6 +394,85 @@ mod tests {
         assert!(n >= 1, "at least the loopback destination");
         assert_eq!(b.scheme(), "udp");
         assert!(b.can_broadcast());
+    }
+
+    #[test]
+    fn a_span_covers_every_port_from_the_base() {
+        let b = beacon(47700).with_span(3);
+        let dests: Vec<String> = b.destinations().iter().map(|a| a.to_string()).collect();
+        for port in 47700..47703 {
+            assert!(dests.contains(&format!("127.0.0.1:{port}")), "{port} missing");
+            assert!(dests.contains(&format!("255.255.255.255:{port}")));
+        }
+        assert!(!dests.iter().any(|d| d.ends_with(":47703")), "span is 3");
+    }
+
+    #[test]
+    fn a_second_responder_takes_the_next_port_instead_of_failing() {
+        let node_a = NodeId::random();
+        let node_b = NodeId::random();
+        // A band of its own, below the ephemeral range. Two tests that both ask
+        // the OS for a port can be handed the same one after it is released,
+        // and then one test's node answers the other test's scan.
+        let base = 21_000;
+        let first = respond_on(
+            announcement_for(node_a, "first", vec![Endpoint::new("tcp", "10.0.0.1:7100")]),
+            base,
+            PORT_SPAN,
+        )
+        .expect("first");
+        let second = respond_on(
+            announcement_for(node_b, "second", vec![Endpoint::new("tcp", "10.0.0.1:7101")]),
+            base,
+            PORT_SPAN,
+        )
+        .expect("the second node must find a port");
+
+        assert_ne!(
+            first.addr().port(),
+            second.addr().port(),
+            "two responders cannot share a port"
+        );
+        for port in [first.addr().port(), second.addr().port()] {
+            assert!((base..base + PORT_SPAN).contains(&port), "{port} is out of band");
+        }
+
+        // ...and a scan of the range finds both, which is the whole point.
+        let found = beacon(base)
+            .with_span(PORT_SPAN)
+            .discover(Duration::from_millis(400))
+            .expect("discover");
+        let names: Vec<&str> = found.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"first"), "{names:?}");
+        assert!(names.contains(&"second"), "{names:?}");
+    }
+
+    #[test]
+    fn a_full_range_reports_the_bind_error() {
+        // Reserved below the ephemeral range, so the other tests in this binary
+        // (which bind port 0) cannot punch a hole in the middle of the span.
+        let mut chosen = None;
+        for base in (22_000..26_000).step_by(PORT_SPAN as usize) {
+            let mut held = Vec::new();
+            for port in ports(base, PORT_SPAN) {
+                match bind_one(Announcement::query(), port) {
+                    Ok(responder) => held.push(responder),
+                    // Somebody else has this span; try the next one.
+                    Err(_) => break,
+                }
+            }
+            if held.len() == PORT_SPAN as usize {
+                chosen = Some((base, held));
+                break;
+            }
+        }
+        let (base, held) = chosen.expect("could not reserve eight free ports");
+
+        assert!(
+            respond_on(Announcement::query(), base, PORT_SPAN).is_err(),
+            "nothing is free, so this must fail rather than answer on a port it does not own"
+        );
+        drop(held);
     }
 }
 

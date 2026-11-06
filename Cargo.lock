@@ -3451,6 +3451,7 @@ name = "retexis-data"
 version = "0.1.0"
 dependencies = [
  "retexis-core",
+ "retexis-crypto",
  "retexis-link-tcp",
  "retexis-routing",
 ]
@@ -3520,7 +3521,6 @@ name = "retexis-sim"
 version = "0.1.0"
 dependencies = [
  "retexis-core",
- "retexis-data",
  "retexis-http",
  "retexis-routing",
 ]

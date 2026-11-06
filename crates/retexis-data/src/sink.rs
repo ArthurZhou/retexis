@@ -86,10 +86,14 @@ impl DataHost {
     }
 
     fn dispatch_stream(&mut self, handle: &MeshHandle, inbound: &InboundFrame) -> bool {
-        let channel = inbound.frame.channel.clone();
         let events = self.assembler.accept(inbound);
         let mut claimed = !events.is_empty();
+        // Route each event by the channel it names, not by the channel of the
+        // frame that happened to trigger the flush: the assembler can emit a
+        // stalled-stream drop for a different channel than the frame being
+        // handled.
         for event in &events {
+            let channel = event.channel();
             for sink in &mut self.sinks {
                 if sink.channels().iter().any(|c| *c == channel) {
                     sink.on_stream(handle, event);
@@ -99,7 +103,10 @@ impl DataHost {
         }
         // A stream chunk that produced no event (a duplicate, say) is still
         // claimed: the channel is ours, there is just nothing new to report.
-        claimed || self.channels().iter().any(|c| *c == channel)
+        claimed || self
+            .channels()
+            .iter()
+            .any(|c| *c == inbound.frame.channel)
     }
 }
 

@@ -90,10 +90,12 @@ impl LinkFactory for UdpFactory {
     /// UDP can broadcast, so discovery is real: a query goes out to the
     /// limited broadcast address and peers answer with their endpoints.
     fn beacon(&self) -> Box<dyn Beacon> {
-        Box::new(retexis_discovery::BroadcastBeacon::new(
-            "udp",
-            self.discovery_port,
-        ))
+        Box::new(
+            retexis_discovery::BroadcastBeacon::new("udp", self.discovery_port)
+                // Two nodes on one host: the second answers on the next port,
+                // so the query has to cover the range it might have taken.
+                .with_span(retexis_discovery::PORT_SPAN),
+        )
     }
 }
 
@@ -377,6 +379,16 @@ fn resolve(addr: &str) -> Result<SocketAddr, LinkError> {
         .ok_or_else(|| LinkError::Framing(format!("cannot resolve '{addr}'")))
 }
 
+impl Drop for UdpLink {
+    fn drop(&mut self) {
+        // A link that is dropped without an explicit `shutdown` still has to
+        // leave the demultiplexer: the map is keyed by peer address, so a
+        // leaked entry keeps flooding a queue nobody reads, and the next
+        // datagram from that peer is delivered into it instead of a new link.
+        self.shutdown();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +517,25 @@ mod tests {
         assert!(acc.local_addr().starts_with("127.0.0.1:"));
         assert_eq!(acc.transport(), "udp");
         assert!(wait_for(|| true, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn a_dropped_link_leaves_the_demultiplexer() {
+        // The peer map is keyed by address. A link that is dropped — not shut
+        // down — must still leave it, or the next datagram from that peer is
+        // pushed into a queue nobody reads and the peer becomes unreachable.
+        let acc = UdpAcceptor::bind("127.0.0.1:0").unwrap();
+        let addr = acc.local_addr();
+        let acceptor = Arc::new(acc);
+        let client = UdpLink::connect(&addr).unwrap();
+
+        client.send(b"one").unwrap();
+        let link = acceptor.accept().expect("first link");
+        assert_eq!(link.recv().unwrap(), b"one");
+        drop(link);
+
+        client.send(b"two").unwrap();
+        let link = acceptor.accept().expect("the same peer must be accepted again");
+        assert_eq!(link.recv().unwrap(), b"two");
     }
 }

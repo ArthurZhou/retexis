@@ -301,10 +301,12 @@ impl LinkFactory for TcpFactory {
     /// Without this, `--listen tcp://...` would be undiscoverable and every
     /// peer address would have to be typed by hand.
     fn beacon(&self) -> Box<dyn Beacon> {
-        Box::new(retexis_discovery::BroadcastBeacon::new(
-            "tcp",
-            self.discovery_port,
-        ))
+        Box::new(
+            retexis_discovery::BroadcastBeacon::new("tcp", self.discovery_port)
+                // Two nodes on one host: the second answers on the next port,
+                // so the query has to cover the range it might have taken.
+                .with_span(retexis_discovery::PORT_SPAN),
+        )
     }
 
     fn listen(&self, addr: &str) -> Result<Box<dyn LinkAcceptor>, LinkError> {

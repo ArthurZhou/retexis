@@ -3,8 +3,11 @@
 //! Identifiers are 128-bit opaque values rendered as lowercase hex.
 //! [`NodeId::short`] gives the 8-character form used in the UI.
 
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -39,6 +42,31 @@ fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// A per-process secret mixed into every identifier.
+///
+/// `RandomState` is seeded by the standard library from the OS, which is the
+/// only entropy source available without `libc` or a dependency. Without it,
+/// ids are a function of the clock and the pid alone: a peer can guess the id
+/// the node will mint next, and the routing layer treats "the packet says it
+/// came from this id" as the truth. This does not make identity verifiable —
+/// that needs keypairs — but it stops the trivial guess.
+fn process_secret() -> u64 {
+    static SECRET: OnceLock<u64> = OnceLock::new();
+    *SECRET.get_or_init(|| {
+        let mut h = RandomState::new().build_hasher();
+        // Mix a second, independently seeded hasher in so the value is not a
+        // single 64-bit draw.
+        h.write_u64(
+            RandomState::new()
+                .build_hasher()
+                .finish()
+                .rotate_left(17)
+                ^ std::process::id() as u64,
+        );
+        h.finish()
+    })
+}
+
 /// Cheap xorshift generator, seeded from wall clock + pid + a counter.
 ///
 /// This is *not* cryptographically secure and is only used to mint
@@ -51,15 +79,20 @@ fn random_bytes() -> [u8; 16] {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x9e37_79b9);
-    let mut s = nanos
+    let mut s = (nanos
         ^ COUNTER.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed)
         ^ ((std::process::id() as u64) << 40)
+        ^ process_secret())
         | 1;
     let mut out = [0u8; 16];
     for chunk in out.chunks_mut(8) {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
+        // Two rounds per word: one xorshift step from a 64-bit state is not
+        // enough mixing when two ids are minted in the same nanosecond.
+        for _ in 0..2 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+        }
         chunk.copy_from_slice(&s.to_le_bytes());
     }
     out
@@ -176,5 +209,30 @@ mod tests {
         let id = NodeId::random();
         let parsed = NodeId::parse_loose(&id.short()).unwrap();
         assert_eq!(parsed.short(), id.short());
+    }
+
+    #[test]
+    fn ids_minted_back_to_back_do_not_repeat() {
+        // The counter is the only thing guaranteeing this when the clock has
+        // not moved; a regression there would hand two nodes the same identity.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            assert!(seen.insert(NodeId::random().hex()), "duplicate id");
+        }
+    }
+
+    #[test]
+    fn ids_are_not_predictable_from_the_clock_alone() {
+        // Two ids minted after the same instant must not share a long prefix;
+        // otherwise the next id is guessable, and `src` is unauthenticated.
+        let a = NodeId::random();
+        let b = NodeId::random();
+        let (ha, hb) = (a.hex(), b.hex());
+        let common = ha
+            .chars()
+            .zip(hb.chars())
+            .take_while(|(x, y)| x == y)
+            .count();
+        assert!(common < 8, "ids share {common} leading hex chars: {ha} / {hb}");
     }
 }

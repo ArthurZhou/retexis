@@ -345,9 +345,17 @@ fn status_body(st: &MeshStatus, me_name: &str) -> String {
         s.auth_rejected
     ));
     out.push_str(&format!(
-        "  limits    flood suppressed {} · duplicate links {}\n",
-        s.flood_suppressed, s.duplicate_links
+        "  limits    flood suppressed {} · duplicate links {} · table full {}\n",
+        s.flood_suppressed, s.duplicate_links, s.route_table_full
     ));
+    if s.acks_rejected > 0 {
+        // Only worth a line when it happens: it means somebody tried to
+        // confirm a message they were not the destination of.
+        out.push_str(&paint(
+            &format!("  rejected  {} ack(s) from the wrong node\n", s.acks_rejected),
+            RED,
+        ));
+    }
     out.push_str(&format!(
         "  wire      in {} / {} frames · out {} / {} frames\n",
         human_bytes(s.bytes_in),

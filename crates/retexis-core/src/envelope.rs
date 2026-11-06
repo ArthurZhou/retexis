@@ -48,10 +48,30 @@ pub const MAX_PAYLOAD: usize = 60 * 1024;
 /// convenience label, not an identity.
 pub const MAX_NAME: usize = 48;
 
+/// Hard cap on the destinations one `route` body may carry.
+///
+/// A route update is link-local gossip, not a database dump. Without a cap a
+/// single 1 MiB frame can advertise ~50 000 destinations, and a peer that
+/// repeats that with fresh ids makes the receiver's table grow without bound.
+/// 4096 is orders of magnitude more than a distance-vector mesh this size
+/// holds, so the cap costs nothing real and bounds the damage.
+pub const MAX_ROUTE_ENTRIES: usize = 4096;
+
+/// Smallest possible encoding of one route entry: id, metric, name length.
+const ROUTE_ENTRY_MIN: usize = 16 + 1 + 1;
+
 /// This envelope carries an authentication tag as its last 16 bytes.
 pub const FLAG_AUTH: u8 = 0x01;
 /// The sender wants the destination to acknowledge receipt (unicast only).
 pub const FLAG_ACK_REQ: u8 = 0x02;
+
+/// Bytes the authentication tag adds to a sealed envelope.
+///
+/// It lives here, not in the crypto crate, because it is part of the *size* of
+/// a packet: whoever decides how much payload fits a frame (a stream sizing its
+/// chunks, a narrow medium picking a fragment size) has to add it even when it
+/// never touches a key. `retexis-crypto` asserts it agrees.
+pub const AUTH_TAG_LEN: usize = 16;
 
 /// Truncates on a UTF-8 boundary so encoding never panics on a long name.
 pub fn truncate_utf8(s: &str, max: usize) -> &str {
@@ -367,6 +387,18 @@ impl Envelope {
         }
     }
 
+    /// Bytes a `Body::Data` envelope occupies on the wire, given the channel and
+    /// the payload length.
+    ///
+    /// The one place that knows the arithmetic: header, a channel-length byte,
+    /// the channel, the content type, a payload-length word, then the payload.
+    /// A medium only has `max_frame` bytes to spend, so anyone deciding how much
+    /// to put in one envelope needs this number — re-deriving it elsewhere is
+    /// how a size limit drifts away from the format it is supposed to bound.
+    pub fn data_len(channel: &str, payload_len: usize) -> usize {
+        HEADER_LEN + 1 + channel.len() + 1 + 4 + payload_len
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
         let mut buf = Vec::with_capacity(HEADER_LEN + 64);
         buf.extend_from_slice(&MAGIC);
@@ -406,6 +438,9 @@ impl Envelope {
                 buf.extend_from_slice(&h.link_id.to_be_bytes());
             }
             Body::Route(r) => {
+                if r.entries.len() > MAX_ROUTE_ENTRIES {
+                    return Err(CodecError::FieldTooLong("route entries"));
+                }
                 if r.entries.len() > u16::MAX as usize {
                     return Err(CodecError::FieldTooLong("route entries"));
                 }
@@ -484,7 +519,16 @@ impl Envelope {
             }
             2 => {
                 let count = cur.u16()? as usize;
-                let mut entries = Vec::with_capacity(count.min(1024));
+                if count > MAX_ROUTE_ENTRIES {
+                    return Err(CodecError::TooLarge(count));
+                }
+                // Refuse a count the packet cannot possibly hold *before*
+                // allocating for it: `count` is attacker-controlled and the
+                // bytes behind it are not.
+                if count * ROUTE_ENTRY_MIN > bytes.len() - cur.pos {
+                    return Err(CodecError::Truncated);
+                }
+                let mut entries = Vec::with_capacity(count);
                 for _ in 0..count {
                     let node = NodeId::from_slice(cur.bytes(16)?).expect("slice is 16 bytes");
                     let metric = cur.u8()?;
@@ -522,11 +566,15 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn bytes(&mut self, n: usize) -> Result<&'a [u8], CodecError> {
-        if self.pos + n > self.buf.len() {
+        // `n` comes from the packet (a u32 length word), so the addition is
+        // done checked: on a 32-bit target `pos + n` can wrap and turn a
+        // truncated packet into a slice that looks valid.
+        let end = self.pos.checked_add(n).ok_or(CodecError::Truncated)?;
+        if end > self.buf.len() {
             return Err(CodecError::Truncated);
         }
-        let out = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
+        let out = &self.buf[self.pos..end];
+        self.pos = end;
         Ok(out)
     }
 
@@ -710,5 +758,41 @@ mod tests {
         assert!(!Envelope::route_update(NodeId::random(), vec![])
             .body
             .is_routable());
+    }
+
+    #[test]
+    fn an_oversized_route_advertisement_is_refused() {
+        // The cap is what keeps one packet from costing a megabyte of table.
+        let entry = (NodeId::random(), 1u8, String::new());
+        let env = Envelope::route_update(
+            NodeId::random(),
+            vec![entry; MAX_ROUTE_ENTRIES + 1],
+        );
+        assert!(matches!(env.encode(), Err(CodecError::FieldTooLong(_))));
+    }
+
+    #[test]
+    fn a_route_count_wider_than_the_packet_is_refused() {
+        // `count` is a u16 the sender controls; the bytes behind it are not.
+        // Decoding must reject it without allocating room for 4000 entries.
+        let mut bytes = Envelope::route_update(NodeId::random(), vec![])
+            .encode()
+            .unwrap();
+        let n = bytes.len();
+        bytes[n - 2..].copy_from_slice(&4000u16.to_be_bytes());
+        assert_eq!(Envelope::decode(&bytes), Err(CodecError::Truncated));
+    }
+
+    #[test]
+    fn a_payload_length_beyond_the_cap_is_refused_before_it_is_reserved() {
+        // `payload_len` is a u32 the sender controls. It must be rejected
+        // against MAX_PAYLOAD before anything tries to reserve that much.
+        let mut bytes = sample_data().encode().unwrap();
+        let len_at = HEADER_LEN + 1 + "chat".len() + 1;
+        bytes[len_at..len_at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(
+            Envelope::decode(&bytes),
+            Err(CodecError::TooLarge(u32::MAX as usize))
+        );
     }
 }

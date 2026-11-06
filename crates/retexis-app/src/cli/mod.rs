@@ -152,7 +152,11 @@ pub fn run() {
             term::line("  ! --announce needs at least one --listen, ignoring it");
             None
         } else {
-            match discovery::respond(announcement.clone(), opts.discovery_port) {
+            match discovery::respond_on(
+                announcement.clone(),
+                opts.discovery_port,
+                discovery::PORT_SPAN,
+            ) {
                 Ok(r) => {
                     term::line(format!(
                         "  · answering discovery on udp://{} as {}",

@@ -876,6 +876,17 @@ impl Link for HubLink {
     }
 }
 
+impl Drop for HubLink {
+    fn drop(&mut self) {
+        // A link dropped without `shutdown` still has to release its port:
+        // otherwise the cable stays `up` with a queue nobody reads, and the
+        // hub keeps "delivering" frames into it while both routers believe
+        // the link is alive.
+        self.closed.store(true, Ordering::Release);
+        self.hub.close_port(self.port);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

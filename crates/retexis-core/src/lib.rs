@@ -23,8 +23,9 @@ pub use discovery::{
     Announcement, Beacon, Endpoint, NoBroadcast, ProbeKind, DEFAULT_PORT, MAX_PROBE, PROBE_MAGIC,
 };
 pub use envelope::{
-    AckBody, Body, CodecError, ContentType, DataBody, Destination, Envelope, HelloBody, RouteBody,
-    FLAG_ACK_REQ, FLAG_AUTH, HEADER_LEN, MAGIC, MAX_NAME, MAX_PAYLOAD, VERSION,
+    truncate_utf8, AckBody, Body, CodecError, ContentType, DataBody, Destination, Envelope,
+    HelloBody, RouteBody, AUTH_TAG_LEN, FLAG_ACK_REQ, FLAG_AUTH, HEADER_LEN, MAGIC, MAX_NAME,
+    MAX_PAYLOAD, MAX_ROUTE_ENTRIES, VERSION,
 };
 pub use id::{MessageId, NodeId};
 pub use link::{

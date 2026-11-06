@@ -10,12 +10,29 @@
 use crate::json::{self, Json};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub const JSON: &str = "application/json; charset=utf-8";
 pub const HTML: &str = "text/html; charset=utf-8";
 pub const TEXT: &str = "text/plain; charset=utf-8";
+
+/// Connections served at once.
+///
+/// A browser tab keeps a handful open; a page that opens thousands — or a
+/// local script that does — would otherwise cost one OS thread each, because
+/// this is a thread-per-connection server with no pool to run out of.
+const MAX_CONNECTIONS: usize = 128;
+
+/// Releases a connection slot when the handler thread ends.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// A parsed request. The body is raw bytes: JSON decoding is opt-in.
 pub struct Request {
@@ -72,15 +89,26 @@ where
     H: Fn(&[String], &Request) -> Response + Send + Sync + 'static,
 {
     let handler = Arc::new(handler);
+    let live = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // Refuse the connection rather than the process when the
+                // thread budget is gone. `incoming()` keeps running either
+                // way, so this degrades to "slow" instead of "dead".
+                if live.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
+                    live.fetch_sub(1, Ordering::Relaxed);
+                    drop(stream);
+                    continue;
+                }
+                let slot = Slot(Arc::clone(&live));
                 let handler = Arc::clone(&handler);
                 // A browser opening six sockets at once must not serialise
                 // behind one slow request, so each connection gets a thread.
                 let _ = std::thread::Builder::new()
                     .name("retexis-http".to_string())
                     .spawn(move || {
+                        let _slot = slot;
                         let _ = handle(stream, handler.as_ref());
                     });
             }

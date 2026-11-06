@@ -71,6 +71,18 @@ fn the_contract_crate_depends_on_nothing() {
     );
 }
 
+/// `AUTH_TAG_LEN` is duplicated: `core` needs it to size a packet, `crypto`
+/// owns the tag. If they ever disagree, every stream chunk sized from the
+/// budget is silently too large on an authenticated link.
+#[test]
+fn the_two_auth_tag_lengths_agree() {
+    assert_eq!(
+        retexis_core::AUTH_TAG_LEN,
+        retexis_crypto::TAG_LEN,
+        "core's packet-size constant drifted from the tag crypto actually writes"
+    );
+}
+
 #[test]
 fn the_data_layer_depends_on_no_medium() {
     // The data layer defines frames and streams. It must not know whether the
@@ -133,12 +145,13 @@ fn only_application_crates_know_which_media_exist() {
 
 #[test]
 fn the_http_crate_is_a_leaf() {
-    // Both applications speak HTTP to a browser. If this crate ever grew a
-    // dependency on one of them, it would stop being reusable by the other.
+    // The simulator serves its control API through this crate. If it ever grew
+    // a dependency on the application that uses it, it would stop being
+    // reusable by the next one.
     let deps = production_dependencies("retexis-http");
     assert!(
         deps.trim().is_empty(),
-        "retexis-http is plumbing; it must stay dependency-free, found://n{deps}"
+        "retexis-http is plumbing; it must stay dependency-free, found:\n{deps}"
     );
 }
 
@@ -155,6 +168,12 @@ fn the_simulator_reuses_routing_instead_of_reimplementing_it() {
     assert!(
         !deps.contains("retexis-link-tcp") && !deps.contains("retexis-link-udp"),
         "the simulated medium must not borrow a real one:\n{deps}"
+    );
+    // It speaks to the router directly, so it has no business depending on the
+    // data layer: frames and streams are what an *application* consumes.
+    assert!(
+        !deps.contains("retexis-data"),
+        "the sim must not pull in the data layer:\n{deps}"
     );
 }
 

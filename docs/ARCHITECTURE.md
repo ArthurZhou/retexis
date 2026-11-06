@@ -224,11 +224,18 @@ tokio 会让"这个 `await` 点在哪"变成阅读理解题，而且在这个规
 | 检查 | 结果 |
 |---|---|
 | `retexis-core` 的 `[dependencies]` | 空。它只是词汇表（信封、ID、trait） |
+| `retexis-crypto` 依赖 | 只有 RustCrypto 的 `sha2` + `hmac`，不知道信封长什么样 |
 | `retexis-routing` 依赖 | 只有 core + crypto，**没有任何介质** |
-| `retexis-app` 依赖 | core + routing，不知道字节怎么走 |
+| `retexis-data` 依赖 | 只有 core + routing，**没有任何介质**（介质只在 dev-deps 里做端到端测试） |
+| `retexis-app` 依赖 | core / crypto / data / routing / discovery / link-*——它是组合根，允许知道介质存在 |
+| `retexis-sim` 依赖 | core + http + routing：它自己就是介质，**不需要数据层**（帧和流是应用的事） |
 | 介质 crate 依赖 | 只有 core（+ discovery），不反向依赖路由 |
 | 线格式里的介质假设 | 无。固定 64B 头 + `max_frame` 由 trait 协商 |
 | 路由层里的介质分支 | 无 `if tcp` / `if udp`，只有 `Link` 的方法调用 |
+
+这三层（介质 / 路由 / 数据）之间只通过 `Link` 与 `Envelope::Data` 的裸字节耦合：
+路由层不解析 payload，数据层不看路由头，介质层两者都不看。`decoupling.rs` 里每一条断言
+都对应上表的一行，包括"模拟器不许依赖数据层"和"HTTP 叶子 crate 不许依赖任何东西"。
 
 ### 审计抓到的两处真实泄漏（已修）
 
@@ -242,6 +249,30 @@ tokio 会让"这个 `await` 点在哪"变成阅读理解题，而且在这个规
 
 还有一处**刻意不修**：`Link::initiator()` 是拨号器的概念（谁主动发起连接），放在介质
 trait 上并不纯粹。但重复链路仲裁要用它，而且所有介质都能如实回答，所以留着。
+
+### 第二轮审计：不变量与它们的证据
+
+第二轮不再只看依赖方向，而是逐层问"这个不变量有东西盯着吗"。没有测试盯着的断言，
+在文档里读起来都一样对。补上之后，四类问题暴露出来：
+
+| 不变量 | 原来的样子 | 现在 |
+|---|---|---|
+| 一个人的预算不能饿死别人 | 先扣全局令牌，再判断按来源预算 | 按来源优先，全局拒绝时退还；有测试拿 50 次拒绝证明全局预算没被吃掉 |
+| 收到的重复不该延长记忆 | 重复包刷新 dedup 时间戳 | 只在首次插入；有测试用一次重放把窗口撑过去 |
+| 只有目的节点能确认送达 | 任何 `Body::Ack` 都清 pending | 校验 `pending.env.dst == from`；有测试注入伪造 ack |
+| 邻居说的东西不能无限占内存 | 路由表、名字表都没有上限 | `MAX_ROUTES` / `MAX_ROUTE_ENTRIES` / 名字随路由过期；名字只给"真的保留路由"的节点存 |
+| 收到的包不能决定我们要分配多少 | route 的 `count` 直接 `with_capacity` | 先比对剩余字节，再分配；条目数还有绝对上限 |
+| 流的名额要能回收 | 丢一个 `Close` 就永久占一个槽位 | 30 秒空闲回收 + 表满时先扫一遍；单流 8 MiB 上限 |
+| 尺寸计算必须算上认证 tag | chunk 预算漏了 16 字节 | 无条件预留，并用一致性测试钉住两个常量 |
+| 一个名字对应几个人时不能猜 | 取 HashMap 迭代到的第一个 | 分层匹配、歧义返回 None，REPL 打印候选 |
+
+每条都有一条会红的测试（在 `features.rs`、`table.rs`、`limiter.rs`、`dedup.rs`、
+`stream.rs`、`narrow_medium.rs`、`json.rs` 里）。这也是这一轮最花时间的地方：
+修复本身多数只有几行，**先写出能让它红的用例**才是真正确认了 bug 存在。
+
+顺带收掉的两个真问题：`resolve` 的歧义会让私聊发给错的人（人身安全 > 可用性，所以宁可拒绝）；
+`publish()` 原来每个事件都全量克隆路由表，密集转发时是"包数 × 名字数"的开销，
+现在结构性变化立即发布、计数类最少间隔 20 ms。
 
 ### 两个应用，一层管道
 
@@ -340,14 +371,41 @@ assert!(production_dependencies("retexis-core").trim().is_empty());
 
 | 位置 | 改动 |
 |---|---|
-| `retexis-link-udp` | 新 crate：`Link` + `LinkAcceptor` + `LinkFactory` |
-| `retexis-node/main.rs` | 一行 `registry.register(Arc::new(UdpFactory::new()))` |
+| `retexis-link-<新>` | 新 crate：`Link` + `LinkAcceptor` + `LinkFactory` |
+| `retexis-app/src/cli/mod.rs` | 一行 `registry.register(Arc::new(...))` |
+| `retexis-gui/src/boot.rs` | 同上一行（两个组合根，各一处） |
 | `retexis-routing` | **0 行** |
 | `retexis-core` | **0 行**（`beacon()` 有默认实现） |
-| `retexis-app` | **0 行** |
+| `retexis-data` | **0 行**（分片尺寸从 `Link::max_frame` 推导，见下） |
+
+早先这张表写的是"`retexis-node/main.rs` 一行"，那是在只有一个应用的时候；GUI 出现之后
+组合根变成两个，注册点也跟着变成两处。这仍然是最小面：协议三层一行不动。
 
 UDP 还顺手证明了另一件事：**分帧权在介质手里是对的**。数据报本身有边界，所以 UDP 介质
 不需要长度前缀、不需要重组、没有半包状态——而路由层完全没察觉区别。
+
+### 尺寸契约：唯一的隐性耦合，已经接上
+
+介质拥有帧上限（`Link::max_frame`），路由遇到装不下的信封**丢弃**而不是分片
+（`DropReason::TooLarge`）。所以"数据层按 60 KiB 打包、介质只有 2 KiB"这个组合不会减速，
+它会静默丢包——一条流在最窄的链路上变成一串空洞。
+
+以前分片大小是常量 `MAX_FRAME_PAYLOAD`，和 `max_frame` 谁也不知道谁。现在
+`StreamSender` 在打开流时向路由要一次当前最窄链路的上限，再减去信封开销
+（`Envelope::data_len`，格式的唯一事实来源），得到每片能装多少：
+
+```rust
+let overhead = Envelope::data_len(channel, CHUNK_HEADER);
+narrowest.saturating_sub(overhead).clamp(1, ceiling)
+```
+
+取"最窄"而不是"到目标的路径"是保守解：路径在路由收敛前不知道，而且偏小只多花几十字节
+头部，偏大就是丢数据。TCP/UDP/hub 的上限都 ≥ 60 KiB，所以这条改动对现有介质是**逐字节
+不变**的；只有窄带介质会真的变小。
+
+`crates/retexis-data/tests/narrow_medium.rs` 用一个 512 字节的内存管道盯着这件事：没有路由
+层的一行改动，4 KiB 的流必须完整出现在介质上，且没有一个信封超过 512 字节。
+
 
 ### 发现为什么是介质的能力
 
@@ -369,6 +427,19 @@ fn beacon(&self) -> Box<dyn Beacon> {
 TCP 的 beacon 值得单说：TCP 不能广播，但**宣告一个 TCP 端点**可以用 UDP 广播。所以
 发现通道永远是 UDP，载荷里写 `tcp://` 还是 `udp://`。这也是为什么 `retexis-discovery`
 是个独立 crate 而不是塞进某个介质里——两个介质指向同一份实现。
+
+**已知的不对称**（写在这里，别假装它是完整的）：发现是两半，只有"问"这一半是介质能力。
+`Beacon::discover` 挂在 `LinkFactory` 上；"答"这一半是 `retexis-discovery::respond_on()`
+这个具体的 IP 实现，由两个应用在启动时直接调用。也就是说：
+
+- 能广播的 IP 介质今天就能被找到，一条 `beacon()` 都不用写（TCP 也是这么白拿的）；
+- 但一个**不跑 IP 的介质**（串口、无线电、CAN）可以问，却没法答——它得自己在应用层接一段，
+  而应用层现在没有为它留 trait。
+
+接入非 IP 介质时这是唯一需要动应用层的地方。要不要把它也抽成能力
+（`LinkFactory::responder()` 返回 `Option<Box<dyn Responder>>`），取决于下一条真实介质是
+什么：如果它仍然走 IP 广播（Wi-Fi、以太网、Tailscale），现在这套就够了。
+
 
 ---
 

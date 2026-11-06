@@ -113,15 +113,34 @@ impl FloodLimiter {
     }
 
     /// May this node relay one more broadcast from `src` right now?
+    ///
+    /// Order matters. The per-source budget is charged first, so a noisy
+    /// neighbour cannot spend the shared one; charging the global bucket first
+    /// meant one source could drain it and starve every other path through
+    /// this node while the per-source limit was doing its job correctly.
     pub fn allow(&mut self, src: NodeId, now: Instant) -> bool {
         if !self.cfg.enabled() {
             return true;
         }
-        if !self.global.take(self.cfg.rate_per_sec, self.cfg.burst, now) {
+        if !self.take_from_source(src, now) {
             self.suppressed += 1;
             return false;
         }
+        if !self.global.take(self.cfg.rate_per_sec, self.cfg.burst, now) {
+            // Nothing was relayed, so the source keeps the token it spent.
+            self.refund_source(src);
+            self.suppressed += 1;
+            return false;
+        }
+        true
+    }
 
+    /// Charges one token to `src`, evicting quiet sources when the map is full.
+    fn take_from_source(&mut self, src: NodeId, now: Instant) -> bool {
+        // `max_sources == 0` means "do not track per-source state at all".
+        if self.cfg.max_sources == 0 {
+            return true;
+        }
         if self.per_source.len() >= self.cfg.max_sources && !self.per_source.contains_key(&src) {
             // Evict sources that have gone quiet; if they all are active, drop
             // the whole map. Losing accounting is better than unbounded growth.
@@ -144,11 +163,16 @@ impl FloodLimiter {
             .per_source
             .entry(src)
             .or_insert_with(|| Bucket::full(self.cfg.per_source_burst, now));
-        let ok = bucket.take(self.cfg.per_source_rate, self.cfg.per_source_burst, now);
-        if !ok {
-            self.suppressed += 1;
+        bucket.take(self.cfg.per_source_rate, self.cfg.per_source_burst, now)
+    }
+
+    fn refund_source(&mut self, src: NodeId) {
+        if !self.cfg.per_source_rate.is_finite() {
+            return;
         }
-        ok
+        if let Some(b) = self.per_source.get_mut(&src) {
+            b.tokens = (b.tokens + 1.0).min(self.cfg.per_source_burst);
+        }
     }
 
     pub fn suppressed(&self) -> u64 {
@@ -254,5 +278,61 @@ mod tests {
             l.allow(NodeId::random(), t);
         }
         assert!(l.tracked_sources() <= 8, "map stayed bounded");
+    }
+
+    #[test]
+    fn a_blocked_source_does_not_spend_the_global_budget() {
+        // The bug this pins: charging the global bucket before the per-source
+        // one let a single noisy neighbour drain the budget every other path
+        // through this node depends on. Budget here is 11 relayed broadcasts:
+        // one for the noisy source, ten for ten quiet ones.
+        let cfg = FloodConfig {
+            rate_per_sec: 100.0,
+            burst: 11.0,
+            per_source_rate: 1.0,
+            per_source_burst: 1.0,
+            max_sources: 64,
+        };
+        let mut l = FloodLimiter::new(cfg);
+        let t = Instant::now();
+
+        let noisy = NodeId::random();
+        assert!(l.allow(noisy, t), "the first packet is relayed");
+        for _ in 0..50 {
+            assert!(!l.allow(noisy, t), "the noisy source is over budget");
+        }
+
+        // The 50 refusals must not have eaten the shared budget: ten other
+        // sources can each still be relayed once.
+        for i in 0..10 {
+            let quiet = NodeId::random();
+            assert!(
+                l.allow(quiet, t),
+                "a quiet source was starved by a blocked one (token {i})"
+            );
+        }
+        assert!(
+            !l.allow(NodeId::random(), t),
+            "the global budget is now empty"
+        );
+    }
+
+    #[test]
+    fn zero_max_sources_means_no_per_source_tracking() {
+        // 0 used to mean "evict everything on every call", which silently
+        // disabled the per-source limit it was supposed to configure.
+        let cfg = FloodConfig {
+            per_source_rate: 2.0,
+            per_source_burst: 2.0,
+            max_sources: 0,
+            ..FloodConfig::default()
+        };
+        let mut l = FloodLimiter::new(cfg);
+        let t = Instant::now();
+        let src = NodeId::random();
+        for _ in 0..100 {
+            assert!(l.allow(src, t), "per-source limits must be off");
+        }
+        assert_eq!(l.tracked_sources(), 0);
     }
 }

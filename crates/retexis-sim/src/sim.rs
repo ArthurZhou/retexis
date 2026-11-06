@@ -43,7 +43,7 @@ const LOG_CAP: usize = 600;
 const CHAT_CHANNEL: &str = "chat";
 
 /// Counters the inspector shows, in display order.
-const STAT_KEYS: [&str; 10] = [
+const STAT_KEYS: [&str; 12] = [
     "sent",
     "delivered",
     "forwarded",
@@ -54,6 +54,8 @@ const STAT_KEYS: [&str; 10] = [
     "flood_suppressed",
     "auth_rejected",
     "duplicate_links",
+    "acks_rejected",
+    "route_table_full",
 ];
 
 #[derive(Clone, Debug)]
@@ -325,8 +327,16 @@ impl Sim {
         }
         if let (Some(x), Some(y)) = (patch.f64_of("x"), patch.f64_of("y")) {
             let mut guard = self.nodes();
-            guard[idx].x = x;
-            guard[idx].y = y;
+            // `idx` was computed before this lock was taken; another request
+            // may have deleted the node in between. Index rather than `get`
+            // and the whole handler thread panics on a perfectly ordinary
+            // race between two clicks.
+            if let Some(node) = guard.get_mut(idx) {
+                node.x = x;
+                node.y = y;
+            } else {
+                return Err("unknown node".into());
+            }
         }
 
         if let Some(alive) = patch.bool_of("alive") {
@@ -396,24 +406,43 @@ impl Sim {
     /// the connections do not — but because a human asked, every cable that is
     /// supposed to be up is re-plugged, not just the supervised ones.
     fn restart(&self, idx: usize, name: &str, ttl: u8) {
-        let (id, old_handle, inbox) = {
+        let (id, old_handle, inbox, alive) = {
             let mut guard = self.nodes();
-            let node = &mut guard[idx];
+            // `idx` may be stale: this runs after the lock was released, and
+            // two overlapping PATCHes are enough to delete the node first.
+            let Some(node) = guard.get_mut(idx) else {
+                return;
+            };
             node.name = name.to_string();
             node.ttl = ttl;
-            (node.id, node.handle.take(), Arc::clone(&node.inbox))
+            (
+                node.id,
+                node.handle.take(),
+                Arc::clone(&node.inbox),
+                node.alive,
+            )
         };
         if let Some(h) = old_handle {
             h.shutdown();
         }
         self.hub.unregister(id);
-        if !self.nodes()[idx].alive {
+        // A node that was deliberately stopped stays stopped; only its
+        // configuration changed.
+        if !alive {
             return;
         }
         let handle = self.start_router(id, name, ttl, inbox);
         {
             let mut guard = self.nodes();
-            guard[idx].handle = Some(handle.clone());
+            match guard.get_mut(idx) {
+                Some(node) => node.handle = Some(handle.clone()),
+                None => {
+                    // Deleted while we were restarting: do not leave an
+                    // orphan router behind.
+                    handle.shutdown();
+                    return;
+                }
+            }
         }
         self.hub.register(id, name.to_string(), handle);
         self.hub.replug(id, false);
@@ -734,6 +763,8 @@ fn stats_json(s: &retexis_routing::Stats) -> Json {
         s.flood_suppressed,
         s.auth_rejected,
         s.duplicate_links,
+        s.acks_rejected,
+        s.route_table_full,
     ];
     Json::obj(
         STAT_KEYS

@@ -77,9 +77,19 @@ struct Wiring {
 
 pub fn run(boot: Boot) -> Result<(), slint::PlatformError> {
     let window = ChatWindow::new()?;
+    // `boot` has to outlive the event loop, not just the wiring.
+    //
+    // The discovery responder answers from a thread that stops the moment the
+    // `Responder` drops, and it lives inside `boot`. Threading `boot` into
+    // `wire` by value used to end it at the first line of the application's
+    // life: the banner said "answering discovery on udp://0.0.0.0:47700" and
+    // the window then answered nobody, so every peer's scan came back empty.
+    // Owning it here also keeps the TCP listener's boot record (listen
+    // addresses, warnings) alive for as long as the window exists.
+    window.set_findable(discovery_status(&boot).into());
     // The timer must outlive `wire`, and `run` only returns when the window
     // closes, so keeping it here is enough.
-    let _timer = wire(&window, boot);
+    let _timer = wire(&window, &boot);
     // `run` shows the window and then spins the event loop; showing it first
     // gives the platform a chance to take focus, so the composer is focused
     // *after* the window exists rather than into a window that is not mapped.
@@ -87,7 +97,23 @@ pub fn run(boot: Boot) -> Result<(), slint::PlatformError> {
     window.invoke_focus_composer();
     open_requested_dialog(&window);
     let _shot = shot_timer(&window);
-    window.run()
+    let result = window.run();
+    // Explicit, and not just for symmetry: this is what keeps the responder
+    // running until the window closes.
+    drop(boot);
+    result
+}
+
+/// What the header says about being findable.
+///
+/// The port we actually took, not the one we asked for: on a host with two
+/// windows the second one answers on 47701, and that is the number a person
+/// needs when the other end is typing an address by hand.
+fn discovery_status(boot: &Boot) -> String {
+    match boot.announced {
+        Some(addr) => format!("FINDABLE :{}", addr.port()),
+        None => "HIDDEN".to_string(),
+    }
 }
 
 /// `RETEXIS_DIALOG=discover|connect`: open a dialog the moment the window is up.
@@ -126,7 +152,7 @@ fn shot_timer(window: &ChatWindow) -> Option<Timer> {
     Some(timer)
 }
 
-fn wire(window: &ChatWindow, boot: Boot) -> Timer {
+fn wire(window: &ChatWindow, boot: &Boot) -> Timer {
     let app = Arc::clone(&boot.app);
     window.set_me_name(app.name().into());
     window.set_me_id(app.id().short().into());

@@ -262,6 +262,167 @@ fn a_plaintext_peer_is_refused_by_an_authenticated_mesh() {
     assert!(bob.status().stats.auth_rejected > 0);
 }
 
+// ------------------------------------------------------------------ trust
+/// An ack is a claim about a message *we* sent, so only the node we sent it to
+/// may make it. Otherwise any member can cancel a retransmission it never
+/// received — turning "delivered" into a lie and losing the message.
+#[test]
+fn an_ack_from_the_wrong_node_does_not_cancel_a_pending_message() {
+    let (alice, _a_rx) = node("alice", |c| {
+        c.retry = RetryPolicy {
+            max_attempts: 3,
+            base_interval: Duration::from_millis(50),
+            max_interval: Duration::from_millis(100),
+        };
+    });
+
+    // A destination that does not exist, so only a forged ack could make this
+    // look delivered.
+    let ghost = retexis_core::NodeId::random();
+    let id = alice
+        .send_reliable(ghost, CHAT, ContentType::Text, "nobody is listening")
+        .unwrap();
+    assert!(
+        wait_until(|| alice.status().pending == 1, Duration::from_secs(1)),
+        "the message should be waiting for an ack"
+    );
+
+    // A link that never completed a handshake can still push bytes at us: this
+    // is what a hostile member looks like from inside `on_inbound`.
+    let (la, rogue) = pipe_pair("alice", "rogue", 0);
+    alice.add_link(la).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+
+    let attacker = retexis_core::NodeId::random();
+    let forged = retexis_core::Envelope::ack(attacker, alice.id(), id, 8)
+        .encode()
+        .expect("encode ack");
+    rogue.send(&forged).unwrap();
+
+    assert!(
+        wait_until(
+            || alice.status().stats.acks_rejected > 0,
+            Duration::from_secs(2)
+        ),
+        "the forged ack was not counted as rejected"
+    );
+    assert_eq!(
+        alice.status().stats.acked,
+        0,
+        "a third party must not be able to confirm a delivery"
+    );
+    assert!(
+        wait_until(
+            || alice.status().stats.delivery_failed == 1,
+            Duration::from_secs(3)
+        ),
+        "the message must still be reported as failed"
+    );
+}
+
+/// A label arrives inside a route advertisement, so it must disappear when the
+/// route does — otherwise the map grows for every node anyone ever mentioned.
+#[test]
+fn a_name_does_not_outlive_the_route_that_carried_it() {
+    let (alice, _a_rx) = node("alice", |c| {
+        c.route_timeout = Duration::from_millis(700);
+    });
+    let (bob, _b_rx) = node("bob", |c| {
+        c.route_timeout = Duration::from_millis(700);
+    });
+    let (carol, _c_rx) = node("carol", |c| {
+        c.route_timeout = Duration::from_millis(700);
+    });
+
+    let (la, lb) = pipe_pair("alice", "bob", 0);
+    let (lb2, lc) = pipe_pair("bob", "carol", 0);
+    alice.add_link(la).unwrap();
+    bob.add_link(lb).unwrap();
+    bob.add_link(lb2).unwrap();
+    carol.add_link(lc).unwrap();
+
+    assert!(
+        wait_until(
+            || alice.status().names.get(&carol.id()).is_some(),
+            Duration::from_secs(5)
+        ),
+        "carol's name should travel with her route"
+    );
+
+    // Cut the far side: bob keeps talking to alice, but carol is gone.
+    let on_bob = bob
+        .links()
+        .into_iter()
+        .find(|l| l.node == Some(carol.id()))
+        .expect("bob's link to carol")
+        .link_id;
+    let on_carol = carol
+        .links()
+        .into_iter()
+        .find(|l| l.node == Some(bob.id()))
+        .expect("carol's link to bob")
+        .link_id;
+    bob.drop_link(on_bob).unwrap();
+    carol.drop_link(on_carol).unwrap();
+
+    assert!(
+        wait_until(
+            || {
+                let st = alice.status();
+                !st.routes.iter().any(|r| r.dst == carol.id())
+                    && !st.names.contains_key(&carol.id())
+            },
+            Duration::from_secs(5)
+        ),
+        "the name outlived the route: routes={:?} names={:?}",
+        alice.status().routes.len(),
+        alice.status().names.len()
+    );
+}
+
+/// `/msg bob` must not deliver a private message to whichever `bob` the map
+/// happened to iterate over first.
+#[test]
+fn an_ambiguous_name_is_refused_instead_of_guessed() {
+    let (alice, _a_rx) = node("alice", |_| {});
+    let (bob1, _b1_rx) = node("bob", |_| {});
+    let (bob2, _b2_rx) = node("bob", |_| {});
+    let (carol, _c_rx) = node("carol", |_| {});
+
+    for (i, peer) in [&bob1, &bob2, &carol].into_iter().enumerate() {
+        let (la, lp) = pipe_pair("alice", &format!("peer{i}"), 0);
+        alice.add_link(la).unwrap();
+        peer.add_link(lp).unwrap();
+    }
+
+    assert!(
+        wait_until(
+            || alice.status().names.len() >= 3,
+            Duration::from_secs(5)
+        ),
+        "alice should know three names, got {:?}",
+        alice.status().names.len()
+    );
+
+    assert_eq!(
+        alice.resolve("bob"),
+        None,
+        "two nodes are called bob; picking one is a coin flip"
+    );
+    assert_eq!(alice.resolve_matches("bob").len(), 2);
+    assert_eq!(alice.resolve("bob1"), None, "no node is called bob1");
+
+    // An unambiguous prefix still works, and so does a short id.
+    assert_eq!(alice.resolve("car"), Some(carol.id()));
+    assert_eq!(alice.resolve(&bob1.id().short()), Some(bob1.id()));
+    assert_eq!(alice.resolve("nobody"), None);
+    assert_eq!(
+        alice.resolve("alice"),
+        Some(alice.id()),
+        "our own name is a name too"
+    );
+}
+
 // ------------------------------------------------------------------ reliability
 
 #[test]

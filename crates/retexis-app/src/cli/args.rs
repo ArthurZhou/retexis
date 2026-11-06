@@ -103,7 +103,9 @@ DISCOVERY:
     --discover-ms <n>        How long to listen for answers (default 800)
     --discover-connect       Dial everything discovery finds
     --announce               Answer other nodes' discovery queries
-    --discovery-port <n>     UDP port for discovery (default 47700)
+    --discovery-port <n>     First UDP port for discovery (default 47700;
+                             the next 7 are the fallback, so a second node
+                             on one host stays findable)
 
     -h, --help               Show this help
 

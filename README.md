@@ -180,7 +180,7 @@ reliable  acked 1   failed 0   retransmits 0
 - **认证是字节流上的过滤器**，在 `Envelope::decode` 之前跑，坏包根本进不了解码器。
 - **介质能力是可选的**。`LinkFactory::beacon()` 默认返回 `NoBroadcast`（`broadcast` 回 0、
   `discover` 回空表），所以点对点介质不用为"不能广播"写任何代码，调用方也不用特判。
-- 每层都能单独测试：213 个 Rust 测试，其中包含真实 TCP/UDP 的多跳、环网、断链、确定性丢包
+- 每层都能单独测试：251 个 Rust 测试，其中包含真实 TCP/UDP 的多跳、环网、断链、确定性丢包
   链路、四链路并发重连、跨两个真路由器的 64 KiB 流式传输、**两个 GUI 窗口互相收发消息**，
   以及**读 Cargo.toml 的解耦约束测试**。
 
@@ -199,7 +199,7 @@ reliable  acked 1   failed 0   retransmits 0
 | `retexis-app` | 应用层：CLI、REPL、渲染、chat | core, data, routing, crypto, discovery, http, link-* |
 | `retexis-node` | 二进制 `retexis`，10 行入口 | app |
 | `retexis-gui` | 桌面聊天：真节点 + 原生窗口 | core, data, routing, crypto, discovery, link-*, slint |
-| `retexis-sim` | 模拟器：虚拟交换机 + JSON API + 单页 UI | core, http, data, routing |
+| `retexis-sim` | 模拟器：虚拟交换机 + JSON API + 单页 UI | core, http, routing |
 
 ## 线格式（v2）
 
@@ -329,8 +329,10 @@ TCP 自己不能广播——连接必须先有地址。但"我的 TCP 端口是 
 
 几个刻意的决定：
 
-- **查询方绑临时端口，应答方回到来源地址**。只有应答方需要占 47700，所以一台机器上可以跑
-  任意多个扫描者；两个节点跑在同一台机器上时用 `--discovery-port` 分开。
+- **查询方绑临时端口，应答方回到来源地址**。只有应答方需要占端口，所以一台机器上可以跑
+  任意多个扫描者。应答方自己挑端口：从 47700 起，被占就顺延（47701、47702……，和监听端
+  7100..7110 是同一个道理），查询则覆盖整段——所以第二个窗口不需要 `--discovery-port`
+  也能被找到，这正是单机同时开两个节点时最容易踩的坑。
 - **查询也发一份到 127.0.0.1**。真实广播包在各平台的回环行为不一致，单机 demo 静默失败是
   最差的第一次体验。
 - **应答和查询一样大**，不能被当成放大器。
@@ -723,39 +725,46 @@ UI 能做的每件事都是一次 API 调用：
 ## 测试
 
 ```bash
-cargo test --workspace                   # 220 个测试
+cargo test --workspace                   # 251 个测试
 cargo clippy --workspace --all-targets
 ```
 
 Rust 侧覆盖的真实场景：
 
 - `crates/retexis-crypto`：FIPS/RFC 4231 向量、截断 tag 校验、密钥不泄漏
-- `crates/retexis-core`：编解码往返、截断拒绝、名字 UTF-8 截断、**冻结的线格式快照**
+- `crates/retexis-core`：编解码往返、截断拒绝、名字 UTF-8 截断、**冻结的线格式快照**、
+  路由条目数上限、`payload_len` 越界在分配前被拒、id 连续生成不重复
 - `crates/retexis-link-tcp`：粘包/半包、超大帧、`shutdown` 唤醒阻塞的 `recv`、能提供发现
 - `crates/retexis-link-udp`：一包一帧不截断、**一个 socket 服务两个邻居**（demux）、
-  `shutdown` 唤醒阻塞的 `recv`、超大报文在发送前被拒、对端不在时发送不报错（UDP 的诚实行为）
+  `shutdown` 唤醒阻塞的 `recv`、超大报文在发送前被拒、对端不在时发送不报错（UDP 的诚实行为）、
+  drop 掉的链路会离开 demux（同一个对端能被重新 accept）
 - `crates/retexis-discovery`：应答方能回答查询、没人应答时返回空表而不是错误、查询不会被
   当成应答（否则两个节点会互相弹）；Windows 上 ICMP port-unreachable 不当致命错误
 - **解耦约束**（`tests/decoupling.rs`，读 Cargo.toml）：路由/应用层不许依赖任何介质，
-  契约层零依赖，介质层不许反向依赖路由，没有 crate 引入 C 工具链
+  契约层零依赖，介质层不许反向依赖路由，模拟器不许依赖数据层，没有 crate 引入 C 工具链
 - `crates/retexis-routing`：
   - 链式两跳（广播 + 单播，hop 计数）、三角环网去重、TTL=1、断链失效
   - **认证**：同密钥收敛、错密钥零路由、明文节点被拒
   - **重传**：确定性丢包链路上 8 条消息全部送达且只投递一次、丢 ACK 靠重应答恢复、
     发不出去时报 `DeliveryFailed`
   - **中继重传**：切掉最后一跳再愈合，重传仍能穿过
+  - **信任边界**：第三方伪造的 ack 会被拒绝，消息仍然报失败；路由表有上限、名字随路由过期；
+    重名节点不会被"猜一个"送信
   - **重连**：`/kick` 式断链后监督线程重拨；四链路并发拨号收敛到一条且不振荡
-  - **限流**：中继被限流、自己发的消息照常送达
+  - **限流**：一个来源打满预算不会饿死其它来源；中继被限流、自己发的消息照常送达
   - **换介质**：同一套路由代码跑在 UDP 上——两节点收敛、一个 socket 两个邻居、广播跨两跳、
     可靠单播被 ack，`retexis-routing` 一行没改
 - `crates/retexis-data`：
   - 帧：构造、content_type 判别、非 UTF-8 不硬转文本
   - 流：顺序重组、乱序缓冲、重复丢弃、丢 Open 仍能收完、Close 有缺口报 `MissingChunks`、
     窗口外的 chunk 被拒、两个发送方复用同一 id 互不干扰
+  - **不会漏尽名额**：丢了 `Close` 的流在空闲超时后被回收，槽位可以再用；单流缓冲超预算报
+    `TooManyBytes`；窗口边界在 u32 末尾不回绕
   - **端到端**：64 KiB / 64 chunk 跨两个真实路由器（TCP）逐字节一致；同一 channel 上帧与流
-    互不串味
+    互不串味；512 字节介质上带 PSK 也能整段送达（chunk 预算含认证 tag）
 - `crates/retexis-app`：CLI 视图（CJK 宽度对齐、空网络给出下一步建议、默认不着色）
-- `crates/retexis-http`：JSON 往返、空 body 当空对象、坏 JSON 报错不 panic、百分号解码
+- `crates/retexis-http`：JSON 往返、空 body 当空对象、坏 JSON 报错不 panic、百分号解码、
+  深层嵌套被拒绝而不是把栈打穿
 - `crates/retexis-gui`：
   - 日志：序号单调、游标只返回新增、ACK 能找到对应消息、按条数和字节双重淘汰
   - 消息：自己的广播只出现一次（路由器回环不能重复显示）、广播流不是私聊、长消息走流
@@ -776,6 +785,9 @@ Rust 侧覆盖的真实场景：
 - **入网认证 ≠ 身份认证**。共享密钥意味着成员之间可以互相冒充。要真身份得每节点密钥对。
 - **没有加密**。tag 只保证完整性和成员资格，内容在线上是明文。
 - **窄带介质缺分片**。装不下就丢并上报 notice，不替介质切片重组（那是介质的事）。
+- **路由表有上限**（2048 条）。路由条目是邻居告诉我们的，所以必须有天花板：否则一个节点
+  逐包换新 id 就能把表撑到 OOM。到顶之后新的目的地址会被忽略（`route_table_full` 计数），
+  已经学会的仍然刷新。直连邻居不受这个上限约束——那是握过手的对端，不是声明。
 - **纯距离矢量有 count-to-infinity 风险**。水平分割 + TTL + 去重把影响限制住了。
 - **泛洪抑制是本地决策**，没有 MPR 那样的协作，所以过载时必然牺牲覆盖。
 - **一个卡住的 TCP 写会拖住 router 线程**。要上吞吐，第一件事是给链路写侧加有界队列 +
@@ -788,6 +800,8 @@ Rust 侧覆盖的真实场景：
 - **GUI 的依赖比协议核心重得多**。`retexis-gui` 带进 242 个 crate（Slint 一整套，含
   winit 和字体栈），并且要求 rustc 1.95；其余 11 个 crate 仍然是 1.75、无 C 工具链。
 - **流没有流控**。快发送方能把慢接收方冲垮，接收方丢弃并报 `Dropped`；真正的背压需要信用窗口。
+  缓冲不是无限的：单流最多 8 MiB，超了报 `TooManyBytes`；30 秒没有任何帧的流会被回收
+  （丢一个 `Close` 就永远占着一个槽位，槽位只有 64 个）。这两个上限是丢，不是卡住。
 - **流的可靠性是逐 chunk 的**。`open_reliable` 每个 chunk 一个 ack，传大文件时 ack 流量可观。
 - **UDP 没有可靠性和分片**。丢包由重传层兜底；超过 64 KiB 的信封在发送前就被拒，不切片。
 - **发现只在同一广播域内有效**。跨子网、跨公网找不到，得给地址。也没有鉴权：任何人都能

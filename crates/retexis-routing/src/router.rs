@@ -14,7 +14,7 @@ use crate::{
 };
 use retexis_core::{Body, Destination, Envelope, Link, LinkId, MessageId, NodeId, FLAG_AUTH};
 use retexis_crypto::{Sealer, TAG_LEN};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, RwLock};
@@ -117,6 +117,7 @@ pub fn start(
         status,
         alive,
         tx,
+        dirty: true,
     };
 
     let jh = thread::Builder::new()
@@ -146,11 +147,24 @@ struct Router {
     status: Arc<RwLock<MeshStatus>>,
     alive: Arc<AtomicBool>,
     tx: Sender<Event>,
+    /// Something a reader would notice changed; publish on the next turn of
+    /// the loop instead of waiting out [`PUBLISH_MIN`].
+    dirty: bool,
 }
+
+/// Minimum gap between published snapshots for *counters*.
+///
+/// `publish` clones the route table and every node name so readers never take
+/// a lock on routing state, and doing that after every forwarded packet made a
+/// busy mesh pay for a full copy per packet. Structural changes — a link, a
+/// route, a pending retransmission — still publish immediately (`dirty`), so
+/// `/peers` never shows a cable that was cut a moment ago.
+const PUBLISH_MIN: Duration = Duration::from_millis(20);
 
 impl Router {
     fn run(mut self, rx: Receiver<Event>) {
         let mut next_announce = Instant::now() + self.announce_interval;
+        let mut last_publish: Option<Instant> = None;
         loop {
             let now = Instant::now();
             let wait = next_announce
@@ -170,7 +184,14 @@ impl Router {
                 self.sweep(now);
                 next_announce = now + self.announce_interval;
             }
-            self.publish();
+            let stale = last_publish
+                .map(|t| now.saturating_duration_since(t) >= PUBLISH_MIN)
+                .unwrap_or(true);
+            if self.dirty || stale {
+                self.publish();
+                self.dirty = false;
+                last_publish = Some(now);
+            }
         }
         self.goodbye();
         self.alive.store(false, Ordering::Release);
@@ -194,6 +215,9 @@ impl Router {
     fn on_link_up(&mut self, link: Arc<dyn Link>) {
         let link_id = link.id();
         if self.neighbors.contains_key(&link_id) {
+            // The same link id twice means somebody reused it. Owning two
+            // reader threads for one cable would double every frame.
+            link.shutdown();
             return;
         }
         let transport = link.transport();
@@ -211,6 +235,7 @@ impl Router {
         self.spawn_reader(link_id, link);
         // Announce ourselves immediately; the peer does the same on its side.
         self.send_hello(link_id);
+        self.dirty = true;
         self.notice(RouterNotice::LinkUp { transport, peer });
     }
 
@@ -235,10 +260,12 @@ impl Router {
                 }
             });
         if spawned.is_err() {
-            self.notice(RouterNotice::LinkDown {
-                transport: "?",
-                peer: link_id.to_string(),
-                reason: "could not spawn reader thread".into(),
+            // No reader means this link can never deliver anything. Report it
+            // through the event queue so the neighbour entry is removed by the
+            // same code path as a real failure.
+            let _ = self.tx.send(Event::LinkLost {
+                link_id,
+                reason: "could not spawn a reader thread".into(),
             });
         }
     }
@@ -259,6 +286,7 @@ impl Router {
                 reason: "link down",
             });
         }
+        self.dirty = true;
         self.notice(RouterNotice::LinkDown {
             transport,
             peer,
@@ -370,12 +398,32 @@ impl Router {
             return;
         }
 
-        self.names.insert(peer, peer_name.clone());
+        // An anonymous hello must not erase a name we already know.
+        if !peer_name.is_empty() {
+            self.names.insert(peer, peer_name.clone());
+        }
 
         let is_new_identity = match self.neighbors.get(&link_id) {
             Some(n) => n.node != Some(peer),
             None => return,
         };
+        // A link that used to belong to somebody else. Forget the old
+        // binding: leaving its route in place would keep sending packets to a
+        // node that is no longer on the other end of this cable.
+        if is_new_identity {
+            let previous = self.neighbors.get(&link_id).and_then(|n| n.node);
+            if let Some(previous) = previous.filter(|p| *p != peer) {
+                if self.table.get(&previous).map(|e| e.next_hop) == Some(link_id) {
+                    self.table.remove(&previous);
+                    let old_name = self.names.remove(&previous).unwrap_or_default();
+                    self.notice(RouterNotice::RouteRemoved {
+                        dst: previous,
+                        name: old_name,
+                        reason: "peer identity changed",
+                    });
+                }
+            }
+        }
 
         // Two nodes can end up with several links between them: both dialled
         // at once, or a reconnect raced a dying socket. Keep exactly one.
@@ -465,6 +513,7 @@ impl Router {
         if is_new_identity {
             self.send_update_to(link_id);
         }
+        self.dirty = true;
     }
 
     fn on_route_update(&mut self, link_id: LinkId, env: Envelope) {
@@ -491,18 +540,26 @@ impl Router {
             if dst == self.me {
                 continue;
             }
-            if !name.is_empty() {
-                // Names ride along with routes: whoever can reach a node
-                // knows what it is called, so the label survives multi-hop.
-                // The advertisement is authoritative — a peer may have been
-                // renamed since the handshake.
-                self.names.insert(dst, name);
-            }
             if dst == from {
+                // The advertiser's own name is authoritative: it is the only
+                // node that gets to say what it is called, and a rename has to
+                // reach us through the same advertisement that carries the
+                // route.
+                if !name.is_empty() {
+                    self.names.insert(dst, name);
+                }
                 continue;
             }
             let candidate = metric.saturating_add(1);
-            match self.table.learn(dst, candidate, link_id, now) {
+            let outcome = self.table.learn(dst, candidate, link_id, now);
+            // Names ride along with routes: whoever can reach a node knows
+            // what it is called, so the label survives multi-hop. They are
+            // only stored for destinations we actually route to — otherwise a
+            // peer could grow this map with names of nodes that do not exist.
+            if !name.is_empty() && outcome != LearnOutcome::Full {
+                self.names.insert(dst, name);
+            }
+            match outcome {
                 LearnOutcome::New => {
                     self.notice(RouterNotice::RouteAdded {
                         dst,
@@ -519,9 +576,15 @@ impl Router {
                         via: self.peer_of(link_id),
                     });
                 }
+                LearnOutcome::Full => {
+                    // Not an error the operator can act on per packet: the
+                    // table is bounded on purpose. Count it once per update.
+                    self.stats.route_table_full += 1;
+                }
                 LearnOutcome::Refreshed | LearnOutcome::Ignored => {}
             }
         }
+        self.dirty = true;
     }
 
     // ----------------------------------------------------------- forwarding
@@ -622,6 +685,7 @@ impl Router {
             },
         );
         self.on_local_send(env);
+        self.dirty = true;
     }
 
     /// The single place where an envelope leaves this node towards the mesh.
@@ -801,9 +865,18 @@ impl Router {
     }
 
     fn on_ack(&mut self, from: NodeId, acked: MessageId) {
+        // Only the node we sent it to may confirm it. Without this check any
+        // member can clear a pending retransmission — and claim a delivery —
+        // for a message it never received.
+        let expected = self.pending.get(&acked).and_then(|p| p.env.dst.target());
+        if expected != Some(from) {
+            self.stats.acks_rejected += 1;
+            return;
+        }
         if let Some(p) = self.pending.remove(&acked) {
             let rtt_ms = p.started.elapsed().as_millis() as u64;
             self.stats.acked += 1;
+            self.dirty = true;
             self.notice(RouterNotice::Delivered {
                 msg: acked,
                 to: from,
@@ -841,6 +914,7 @@ impl Router {
             if attempts >= self.retry.max_attempts {
                 self.pending.remove(&id);
                 self.stats.delivery_failed += 1;
+                self.dirty = true;
                 let dst = env.dst.target().unwrap_or_default();
                 self.notice(RouterNotice::DeliveryFailed {
                     msg: id,
@@ -875,22 +949,40 @@ impl Router {
     }
 
     fn send_update_to(&mut self, link_id: LinkId) {
-        if self.neighbors.get(&link_id).and_then(|n| n.node).is_none() {
+        let (identified, max_frame) = match self.neighbors.get(&link_id) {
+            Some(n) => (n.node.is_some(), n.link.max_frame()),
+            None => return,
+        };
+        if !identified {
             return; // do not gossip to an unidentified peer
         }
-        let entries: Vec<(NodeId, u8, String)> = self
-            .table
-            .update_for(self.me, Some(link_id))
-            .into_iter()
-            .map(|(node, metric)| {
-                let name = if node == self.me {
-                    self.name.clone()
-                } else {
-                    self.name_of(node)
-                };
-                (node, metric, name)
-            })
-            .collect();
+
+        // The advertisement has to fit the medium that carries it. A table of
+        // 2000 entries is 100 KiB of names; UDP would drop that frame, and
+        // `send_via` would report `TooLarge` once per announce interval
+        // forever. Trim the *far* end instead: `update_for` sorts by metric, so
+        // stopping early loses the destinations this neighbour could not
+        // profitably reach anyway.
+        let mut budget = max_frame.saturating_sub(
+            retexis_core::HEADER_LEN
+                + 2 // entry count
+                + if self.sealer.is_some() { TAG_LEN } else { 0 },
+        );
+        let mut entries: Vec<(NodeId, u8, String)> = Vec::new();
+        for (node, metric) in self.table.update_for(self.me, Some(link_id)) {
+            let name = if node == self.me {
+                self.name.clone()
+            } else {
+                self.name_of(node)
+            };
+            // node id + metric + name length + name, exactly as encoded.
+            let cost = 16 + 1 + 1 + retexis_core::truncate_utf8(&name, retexis_core::MAX_NAME).len();
+            if cost > budget || entries.len() >= retexis_core::MAX_ROUTE_ENTRIES {
+                break;
+            }
+            budget -= cost;
+            entries.push((node, metric, name));
+        }
         let env = Envelope::route_update(self.me, entries);
         self.send_via(link_id, &env);
     }
@@ -918,6 +1010,7 @@ impl Router {
 
     fn sweep(&mut self, now: Instant) {
         for dst in self.table.expire(now, self.route_timeout) {
+            self.dirty = true;
             self.notice(RouterNotice::RouteRemoved {
                 dst,
                 name: self.name_of(dst),
@@ -925,6 +1018,26 @@ impl Router {
             });
         }
         self.dedup.sweep(now);
+        self.prune_names();
+    }
+
+    /// Drops labels for nodes we no longer know.
+    ///
+    /// Names arrive inside route advertisements, so the map is as
+    /// attacker-influenced as the table — it grows with it and has to shrink
+    /// with it, or an expired route leaves its name behind forever.
+    fn prune_names(&mut self) {
+        if self.names.is_empty() {
+            return;
+        }
+        let mut keep: HashSet<NodeId> = self.table.iter().map(|(dst, _)| *dst).collect();
+        keep.insert(self.me);
+        for n in self.neighbors.values() {
+            if let Some(id) = n.node {
+                keep.insert(id);
+            }
+        }
+        self.names.retain(|id, _| keep.contains(id));
     }
 
     // -------------------------------------------------------------- helpers

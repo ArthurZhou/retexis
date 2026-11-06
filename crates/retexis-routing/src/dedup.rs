@@ -39,6 +39,13 @@ impl DedupCache {
     }
 
     /// Records `id` and reports whether it was already known.
+    ///
+    /// A duplicate does **not** refresh the timestamp. The window is "how long
+    /// after first sight a repeat is still a repeat", and extending it on every
+    /// repeat would let a replayed id live forever — which is exactly what an
+    /// attacker holding one captured packet would do to keep a slot, and what
+    /// a stale duplicate needs in order to slip through after the real window
+    /// has closed.
     pub fn mark(&mut self, id: MessageId, now: Instant) -> DedupOutcome {
         if self.seen.len() >= SOFT_CAP {
             self.sweep(now);
@@ -54,9 +61,12 @@ impl DedupCache {
                 }
             }
         }
-        match self.seen.insert(id, now) {
-            None => DedupOutcome::New,
-            Some(_) => DedupOutcome::Duplicate,
+        match self.seen.entry(id) {
+            std::collections::hash_map::Entry::Occupied(_) => DedupOutcome::Duplicate,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(now);
+                DedupOutcome::New
+            }
         }
     }
 
@@ -105,5 +115,21 @@ mod tests {
         assert!(c.is_new(id, t));
         c.sweep(t + Duration::from_secs(5));
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn replaying_a_packet_does_not_extend_its_window() {
+        // One captured packet, replayed forever: the entry must still expire
+        // on schedule from the *first* sight, or the replay pins the cache.
+        let mut c = DedupCache::new(Duration::from_secs(1));
+        let id = MessageId::random();
+        let t = Instant::now();
+        assert!(c.is_new(id, t));
+        assert_eq!(c.mark(id, t + Duration::from_millis(900)), DedupOutcome::Duplicate);
+        c.sweep(t + Duration::from_millis(1100));
+        assert!(
+            c.is_empty(),
+            "a duplicate refreshed the timestamp and kept the id alive"
+        );
     }
 }

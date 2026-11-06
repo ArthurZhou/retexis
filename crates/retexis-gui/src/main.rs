@@ -22,7 +22,7 @@ OPTIONS:
     --discover               scan at startup and dial everyone found
     --say <TEXT>             broadcast TEXT once at startup
     --no-announce            do not answer discovery queries
-    --discovery-port <PORT>  UDP port for discovery  [default: 47700]
+    --discovery-port <PORT>  First UDP port for discovery  [default: 47700]
     --ttl <N>                hop budget              [default: 8]
     -h, --help               print this help
 

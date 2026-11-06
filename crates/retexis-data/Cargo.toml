@@ -13,3 +13,4 @@ retexis-routing.workspace = true
 
 [dev-dependencies]
 retexis-link-tcp.workspace = true
+retexis-crypto.workspace = true

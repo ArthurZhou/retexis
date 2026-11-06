@@ -134,8 +134,7 @@ fn send_stream(handle: &MeshHandle, rest: &str) {
         term::line("usage: /stream <peer|id> <text>");
         return;
     };
-    let Some(dst) = handle.resolve(who) else {
-        term::line(format!("! unknown peer '{who}' (try /peers or /routes)"));
+    let Some(dst) = target(handle, who) else {
         return;
     };
     // Small chunks on purpose: a 40-byte message should visibly become several
@@ -253,12 +252,9 @@ fn unicast(handle: &MeshHandle, rest: &str) {
         term::line("usage: /msg <peer|short-id> <text>");
         return;
     }
-    let dst = match handle.resolve(token) {
+    let dst = match target(handle, token) {
         Some(id) => id,
-        None => {
-            term::line(format!("! unknown peer '{token}' — try /peers"));
-            return;
-        }
+        None => return,
     };
     // DMs are reliable: the destination acks and the router retransmits, so
     // delivery (or failure) shows up as a notice a moment later.
@@ -276,12 +272,9 @@ fn kick(handle: &MeshHandle, token: &str) {
         term::line("usage: /kick <peer|short-id>");
         return;
     }
-    let dst = match handle.resolve(token) {
+    let dst = match target(handle, token) {
         Some(id) => id,
-        None => {
-            term::line(format!("! unknown peer '{token}' — try /peers"));
-            return;
-        }
+        None => return,
     };
     let targets: Vec<_> = handle
         .status()
@@ -301,6 +294,32 @@ fn kick(handle: &MeshHandle, token: &str) {
         "- dropped {count} link(s) to {}; a supervised dialer will reconnect",
         name_of(handle, dst)
     ));
+}
+
+/// Resolves a typed token to one peer, explaining the failure when it cannot.
+///
+/// An ambiguous token is a refusal, not a guess: `/msg bob` with two `bob`s in
+/// the mesh must not deliver a private message to whichever one the router
+/// happened to list first.
+fn target(handle: &MeshHandle, token: &str) -> Option<NodeId> {
+    if let Some(id) = handle.resolve(token) {
+        return Some(id);
+    }
+    let matches = handle.resolve_matches(token);
+    if matches.is_empty() {
+        term::line(format!("! unknown peer '{token}' — try /peers or /routes"));
+    } else {
+        let list: Vec<String> = matches
+            .iter()
+            .map(|id| format!("{} ({})", name_of(handle, *id), id.short()))
+            .collect();
+        term::line(format!(
+            "! '{token}' matches {} nodes: {} — type more, or use the short id",
+            matches.len(),
+            list.join(", ")
+        ));
+    }
+    None
 }
 
 fn name_of(handle: &MeshHandle, id: NodeId) -> String {

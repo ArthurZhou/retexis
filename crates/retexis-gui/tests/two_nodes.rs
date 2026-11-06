@@ -264,3 +264,80 @@ fn startup_say_and_connect_still_work() {
         "the node booted with --say/--connect is not sending"
     );
 }
+
+// ---------------------------------------------------------------- discovery
+
+/// A port below the ephemeral range, so these two tests never hand each other
+/// the same number: `free_udp_port`-style helpers do exactly that when the
+/// tests run in parallel, and then one test's node answers the other's scan.
+fn test_discovery_port(offset: u16) -> u16 {
+    31_000 + offset
+}
+
+#[test]
+fn a_booted_node_answers_discovery_for_as_long_as_it_is_alive() {
+    // The responder lives inside `Boot` and answers from a thread that stops as
+    // soon as it is dropped. That is why the window has to own the boot record
+    // for the whole run: one `wire(&window, boot)` by value and the node goes
+    // deaf while the banner still says it is answering.
+    let port = test_discovery_port(0);
+    let opts = Options {
+        name: "findme".into(),
+        listen: vec!["tcp://127.0.0.1:0".into()],
+        announce: true,
+        discovery_port: port,
+        ..Default::default()
+    };
+
+    let alice = boot::boot(&opts).expect("boot");
+    assert!(alice.responder.is_some(), "it said it would announce");
+    assert_eq!(
+        alice.announced.map(|a| a.port()),
+        Some(port),
+        "the header's FINDABLE number has to be the port it really took"
+    );
+    assert!(find(port).iter().any(|a| a.name == "findme"), "nobody answered");
+
+    drop(alice);
+
+    // ...and silence afterwards, which is the other half of the contract.
+    assert!(
+        find(port).is_empty(),
+        "a dropped node must stop answering, otherwise the test proves nothing"
+    );
+}
+
+#[test]
+fn a_second_node_on_the_same_host_is_still_findable() {
+    // Two windows on one machine is the normal way to try this out, and only
+    // one process can bind a given UDP port.
+    let port = test_discovery_port(10);
+    let mut opts = Options {
+        name: "one".into(),
+        listen: vec!["tcp://127.0.0.1:0".into()],
+        announce: true,
+        discovery_port: port,
+        ..Default::default()
+    };
+    let first = boot::boot(&opts).expect("boot one");
+    opts.name = "two".into();
+    let second = boot::boot(&opts).expect("boot two");
+
+    assert!(first.responder.is_some());
+    assert!(second.responder.is_some(), "the second node must not go deaf");
+    assert_ne!(
+        second.announced.map(|a| a.port()),
+        Some(port),
+        "it cannot share the first node's port"
+    );
+
+    let names: Vec<String> = find(port).into_iter().map(|a| a.name).collect();
+    assert!(names.contains(&"one".to_string()), "{names:?}");
+    assert!(names.contains(&"two".to_string()), "{names:?}");
+}
+
+fn find(port: u16) -> Vec<retexis_core::Announcement> {
+    let beacon =
+        retexis_discovery::BroadcastBeacon::new("tcp", port).with_span(retexis_discovery::PORT_SPAN);
+    retexis_core::Beacon::discover(&beacon, Duration::from_millis(600)).unwrap_or_default()
+}
